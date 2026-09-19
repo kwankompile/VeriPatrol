@@ -1,0 +1,800 @@
+"""Configuration loading and validation for AI ANPR."""
+
+from __future__ import annotations
+
+import os
+import re
+import importlib.util
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+VALID_SOURCES = frozenset({"rtsp", "video", "image", "webcam"})
+VALID_DEVICES = frozenset({"cpu", "cuda"})
+VALID_EVIDENCE_MODES = frozenset({"metadata", "upload"})
+VALID_OCR_ENGINES = frozenset({"paddleocr"})
+
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+FOUNDATION_DIRECTORIES = (
+    "models/vehicle",
+    "models/plate",
+    "samples/videos",
+    "samples/images",
+    "runs",
+    ".cache",
+)
+
+
+class ConfigValidationError(Exception):
+    """Raised when configuration validation fails."""
+
+    def __init__(self, errors: list[str]) -> None:
+        self.errors = errors
+        super().__init__("; ".join(errors))
+
+
+@dataclass
+class ValidationResult:
+    """Collected validation messages for operator-facing output."""
+
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    info: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    def add_error(self, message: str) -> None:
+        self.errors.append(message)
+
+    def add_warning(self, message: str) -> None:
+        self.warnings.append(message)
+
+    def add_info(self, message: str) -> None:
+        self.info.append(message)
+
+
+def parse_str(value: str | None, default: str) -> str:
+    if value is None or value.strip() == "":
+        return default
+    return value.strip()
+
+
+def parse_optional_str(value: str | None) -> str | None:
+    if value is None or value.strip() == "":
+        return None
+    return value.strip()
+
+
+def parse_int(value: str | None, default: int) -> int:
+    if value is None or value.strip() == "":
+        return default
+    return int(value.strip())
+
+
+def parse_float(value: str | None, default: float) -> float:
+    if value is None or value.strip() == "":
+        return default
+    return float(value.strip())
+
+
+def parse_bool(value: str | None, default: bool) -> bool:
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_path(value: str | None, default: str) -> str:
+    return parse_str(value, default)
+
+
+def load_env_file(path: Path | str = ".env") -> dict[str, str]:
+    """Parse a simple KEY=VALUE .env file using the standard library only."""
+    env_path = Path(path)
+    if not env_path.is_file():
+        return {}
+
+    values: dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _merged_env() -> dict[str, str]:
+    """Merge defaults, .env values, and operating-system environment variables."""
+    merged = load_env_file(".env")
+    merged.update(os.environ)
+    return merged
+
+
+RTSP_URL_CLI_ERROR = (
+    "RTSP URLs must be configured with ANPR_RTSP_URL in .env or environment variables. "
+    "Use: python main.py run --source rtsp --dry-run"
+)
+
+
+def is_rtsp_source_path(source_path: str) -> bool:
+    """Return True when a CLI source path looks like an RTSP URL."""
+    lowered = source_path.strip().lower()
+    return lowered.startswith("rtsp://") or lowered.startswith("rtsps://")
+
+
+def infer_source_from_path(source_path: str) -> tuple[str, str]:
+    """Infer source type and normalized path from a local file path."""
+    suffix = Path(source_path).suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return "image", source_path.strip()
+    if suffix in VIDEO_EXTENSIONS:
+        return "video", source_path.strip()
+    return "video", source_path.strip()
+
+
+def is_plausible_rtsp_url(url: str) -> bool:
+    parsed = urlparse(url.strip())
+    return parsed.scheme in {"rtsp", "rtsps"} and bool(parsed.netloc)
+
+
+def mask_rtsp_url(url: str) -> str:
+    """Return an RTSP URL with credentials redacted for logs and summaries."""
+    if not url or not url.strip():
+        return "rtsp://***"
+
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in {"rtsp", "rtsps"}:
+            return url
+
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+
+        masked = f"{parsed.scheme}://"
+        if parsed.username or parsed.password:
+            masked += "***@"
+        masked += host
+        if parsed.path:
+            masked += parsed.path
+        if parsed.query:
+            masked += f"?{parsed.query}"
+        return masked
+    except Exception:
+        return "rtsp://***"
+
+
+@dataclass
+class Config:
+    """Typed ANPR configuration."""
+
+    source: str = "video"
+    rtsp_url: str = ""
+    video_path: str = "samples/videos/test_vehicle.mp4"
+    image_path: str = "samples/images/frame.jpg"
+    camera_index: int = 0
+
+    vehicle_model: str = "models/vehicle/yolo11s.pt"
+    plate_model: str = "models/plate/license-plate-finetune-v1s.pt"
+    device: str = "cpu"
+
+    target_fps: float = 3.0
+    vehicle_conf: float = 0.35
+    plate_conf: float = 0.25
+    vehicle_crop_padding_ratio: float = 0.20
+    motorcycle_crop_padding_ratio: float = 0.35
+    plate_fallback_max_distance_ratio: float = 0.60
+    track_iou_threshold: float = 0.3
+    track_expiry_seconds: float = 2.0
+    early_finalize_min_votes: int = 3
+    early_finalize_min_confidence: float = 0.90
+    min_plate_votes: int = 2
+    min_ocr_confidence: float = 0.3
+    duplicate_cooldown_seconds: float = 10.0
+
+    ocr_engine: str = "paddleocr"
+    ocr_lang: str = "en"
+    ocr_preprocess: bool = True
+    ocr_scale: float = 2.0
+    ocr_min_interval_seconds: float = 0.35
+
+    backend_enabled: bool = False
+    backend_base_url: str = "http://localhost:8000/api"
+    camera_email: str | None = None
+    camera_password: str | None = None
+    backend_token_cache: str = ".cache/backend_token.json"
+    backend_queue_file: str = ".cache/backend_queue.jsonl"
+    backend_retry_limit: int = 3
+    backend_timeout_seconds: float = 10.0
+
+    evidence_mode: str = "upload"
+    runs_dir: str = "runs"
+    save_local_evidence: bool = True
+    delete_local_after_upload: bool = False
+    evidence_retention_days: int = 0
+
+    max_seconds: float | None = None
+
+    debug_detections: bool = False
+
+    rtsp_reconnect_enabled: bool = True
+    rtsp_reconnect_max_attempts: int = 0
+    rtsp_reconnect_initial_delay_seconds: float = 2.0
+    rtsp_reconnect_max_delay_seconds: float = 30.0
+    rtsp_read_failure_limit: int = 10
+    rtsp_health_log_interval_seconds: float = 15.0
+    backend_queue_flush_interval_seconds: float = 10.0
+
+    @classmethod
+    def from_env(cls) -> Config:
+        """Load configuration from .env, environment variables, and defaults."""
+        env = _merged_env()
+        return cls(
+            source=parse_str(env.get("ANPR_SOURCE"), "video"),
+            rtsp_url=parse_str(env.get("ANPR_RTSP_URL"), ""),
+            video_path=parse_path(env.get("ANPR_VIDEO_PATH"), "samples/videos/test_vehicle.mp4"),
+            image_path=parse_path(env.get("ANPR_IMAGE_PATH"), "samples/images/frame.jpg"),
+            camera_index=parse_int(env.get("ANPR_CAMERA_INDEX"), 0),
+            vehicle_model=parse_path(env.get("ANPR_VEHICLE_MODEL"), "models/vehicle/yolo11s.pt"),
+            plate_model=parse_path(env.get("ANPR_PLATE_MODEL"), "models/plate/license-plate-finetune-v1s.pt"),
+            device=parse_str(env.get("ANPR_DEVICE"), "cpu"),
+            target_fps=parse_float(env.get("ANPR_TARGET_FPS"), 3.0),
+            vehicle_conf=parse_float(env.get("ANPR_VEHICLE_CONF"), 0.35),
+            plate_conf=parse_float(env.get("ANPR_PLATE_CONF"), 0.25),
+            vehicle_crop_padding_ratio=parse_float(
+                env.get("ANPR_VEHICLE_CROP_PADDING_RATIO"), 0.20
+            ),
+            motorcycle_crop_padding_ratio=parse_float(
+                env.get("ANPR_MOTORCYCLE_CROP_PADDING_RATIO"), 0.35
+            ),
+            plate_fallback_max_distance_ratio=parse_float(
+                env.get("ANPR_PLATE_FALLBACK_MAX_DISTANCE_RATIO"), 0.60
+            ),
+            track_iou_threshold=parse_float(env.get("ANPR_TRACK_IOU_THRESHOLD"), 0.3),
+            track_expiry_seconds=parse_float(env.get("ANPR_TRACK_EXPIRY_SECONDS"), 2.0),
+            early_finalize_min_votes=parse_int(env.get("ANPR_EARLY_FINALIZE_MIN_VOTES"), 3),
+            early_finalize_min_confidence=parse_float(
+                env.get("ANPR_EARLY_FINALIZE_MIN_CONFIDENCE"), 0.90
+            ),
+            min_plate_votes=parse_int(env.get("ANPR_MIN_PLATE_VOTES"), 2),
+            min_ocr_confidence=parse_float(env.get("ANPR_MIN_OCR_CONFIDENCE"), 0.3),
+            duplicate_cooldown_seconds=parse_float(
+                env.get("ANPR_DUPLICATE_COOLDOWN_SECONDS"), 10.0
+            ),
+            ocr_engine=parse_str(env.get("ANPR_OCR_ENGINE"), "paddleocr"),
+            ocr_lang=parse_str(env.get("ANPR_OCR_LANG"), "en"),
+            ocr_preprocess=parse_bool(env.get("ANPR_OCR_PREPROCESS"), True),
+            ocr_scale=parse_float(env.get("ANPR_OCR_SCALE"), 2.0),
+            ocr_min_interval_seconds=parse_float(
+                env.get("ANPR_OCR_MIN_INTERVAL_SECONDS"), 0.35
+            ),
+            backend_enabled=parse_bool(env.get("ANPR_BACKEND_ENABLED"), False),
+            backend_base_url=parse_str(env.get("ANPR_BACKEND_BASE_URL"), "http://localhost:8000/api"),
+            camera_email=parse_optional_str(env.get("ANPR_CAMERA_EMAIL")),
+            camera_password=parse_optional_str(env.get("ANPR_CAMERA_PASSWORD")),
+            backend_token_cache=parse_path(env.get("ANPR_BACKEND_TOKEN_CACHE"), ".cache/backend_token.json"),
+            backend_queue_file=parse_path(env.get("ANPR_BACKEND_QUEUE_FILE"), ".cache/backend_queue.jsonl"),
+            backend_retry_limit=parse_int(env.get("ANPR_BACKEND_RETRY_LIMIT"), 3),
+            backend_timeout_seconds=parse_float(env.get("ANPR_BACKEND_TIMEOUT_SECONDS"), 10.0),
+            evidence_mode=parse_str(env.get("ANPR_EVIDENCE_MODE"), "upload"),
+            runs_dir=parse_path(env.get("ANPR_RUNS_DIR"), "runs"),
+            save_local_evidence=parse_bool(env.get("ANPR_SAVE_LOCAL_EVIDENCE"), True),
+            delete_local_after_upload=parse_bool(env.get("ANPR_DELETE_LOCAL_AFTER_UPLOAD"), False),
+            evidence_retention_days=parse_int(env.get("ANPR_EVIDENCE_RETENTION_DAYS"), 0),
+            debug_detections=parse_bool(env.get("ANPR_DEBUG_DETECTIONS"), False),
+            rtsp_reconnect_enabled=parse_bool(env.get("ANPR_RTSP_RECONNECT_ENABLED"), True),
+            rtsp_reconnect_max_attempts=parse_int(env.get("ANPR_RTSP_RECONNECT_MAX_ATTEMPTS"), 0),
+            rtsp_reconnect_initial_delay_seconds=parse_float(
+                env.get("ANPR_RTSP_RECONNECT_INITIAL_DELAY_SECONDS"), 2.0
+            ),
+            rtsp_reconnect_max_delay_seconds=parse_float(
+                env.get("ANPR_RTSP_RECONNECT_MAX_DELAY_SECONDS"), 30.0
+            ),
+            rtsp_read_failure_limit=parse_int(env.get("ANPR_RTSP_READ_FAILURE_LIMIT"), 10),
+            rtsp_health_log_interval_seconds=parse_float(
+                env.get("ANPR_RTSP_HEALTH_LOG_INTERVAL_SECONDS"), 15.0
+            ),
+            backend_queue_flush_interval_seconds=parse_float(
+                env.get("ANPR_BACKEND_QUEUE_FLUSH_INTERVAL_SECONDS"), 10.0
+            ),
+        )
+
+    def project_root_path(self) -> Path:
+        return Path.cwd().resolve()
+
+    def runs_dir_path(self) -> Path:
+        return Path(self.runs_dir)
+
+    def resolved_source_path(self) -> str | None:
+        if self.source == "rtsp":
+            return self.rtsp_url or None
+        if self.source == "video":
+            return self.video_path
+        if self.source == "image":
+            return self.image_path
+        if self.source == "webcam":
+            return str(self.camera_index)
+        return None
+
+    def apply_cli_overrides(self, args: Any) -> Config:
+        """Apply CLI argument overrides on top of loaded configuration."""
+        if getattr(args, "source", None):
+            self.source = args.source
+        if getattr(args, "source_path", None):
+            if is_rtsp_source_path(args.source_path):
+                pass
+            else:
+                inferred_source, inferred_path = infer_source_from_path(args.source_path)
+                self.source = inferred_source
+                if inferred_source == "image":
+                    self.image_path = inferred_path
+                else:
+                    self.video_path = inferred_path
+        if getattr(args, "video", None):
+            self.source = "video"
+            self.video_path = args.video
+        if getattr(args, "image", None):
+            self.source = "image"
+            self.image_path = args.image
+        if getattr(args, "camera_index", None) is not None:
+            self.source = "webcam"
+            self.camera_index = args.camera_index
+        if getattr(args, "max_seconds", None) is not None:
+            self.max_seconds = args.max_seconds
+        return self
+
+
+def check_foundation_config(config: Config) -> ValidationResult:
+    """Ensure foundation directories exist and runs_dir is writable."""
+    result = ValidationResult()
+
+    for relative_dir in FOUNDATION_DIRECTORIES:
+        directory = Path(relative_dir)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            result.add_info(f"OK: directory ready: {relative_dir}")
+        except OSError as exc:
+            result.add_error(f"Cannot create directory {relative_dir}: {exc}")
+
+    runs_dir = config.runs_dir_path()
+    try:
+        runs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        result.add_error(f"Cannot create runs directory {runs_dir}: {exc}")
+
+    test_file = runs_dir / ".write_test"
+    try:
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink(missing_ok=True)
+        result.add_info(f"OK: runs directory is writable: {runs_dir}")
+    except OSError as exc:
+        result.add_error(f"Runs directory is not writable ({runs_dir}): {exc}")
+
+    return result
+
+
+def _validate_source(config: Config, result: ValidationResult) -> None:
+    if config.source not in VALID_SOURCES:
+        result.add_error(
+            f"ANPR_SOURCE must be one of {', '.join(sorted(VALID_SOURCES))}; got '{config.source}'."
+        )
+        return
+
+    if config.source == "rtsp":
+        if not config.rtsp_url.strip():
+            result.add_error(
+                "RTSP source requires ANPR_RTSP_URL in .env or environment variables."
+            )
+        elif not is_plausible_rtsp_url(config.rtsp_url):
+            result.add_error("RTSP URL is not plausible. Check ANPR_RTSP_URL in .env.")
+        else:
+            result.add_info("OK: RTSP URL configured (ANPR_RTSP_URL)")
+
+    elif config.source == "video":
+        video_path = Path(config.video_path)
+        if not config.video_path.strip():
+            result.add_error("Video source requires ANPR_VIDEO_PATH or --video/--source-path.")
+        elif not video_path.is_file():
+            result.add_error(f"Video file does not exist: {config.video_path}")
+        else:
+            result.add_info(f"OK: video file found: {config.video_path}")
+
+    elif config.source == "image":
+        image_path = Path(config.image_path)
+        if not config.image_path.strip():
+            result.add_error("Image source requires ANPR_IMAGE_PATH or --image/--source-path.")
+        elif not image_path.is_file():
+            result.add_error(f"Image file does not exist: {config.image_path}")
+        else:
+            result.add_info(f"OK: image file found: {config.image_path}")
+
+    elif config.source == "webcam":
+        if config.camera_index < 0:
+            result.add_error(
+                f"Webcam camera index must be >= 0; got {config.camera_index}."
+            )
+        else:
+            result.add_info(f"OK: webcam camera index configured: {config.camera_index}")
+
+
+def _validate_models(config: Config, result: ValidationResult, strict: bool) -> None:
+    if not config.vehicle_model.strip():
+        result.add_error("ANPR_VEHICLE_MODEL must be configured.")
+    else:
+        vehicle_path = Path(config.vehicle_model)
+        if vehicle_path.is_file():
+            result.add_info(f"OK: vehicle model found: {config.vehicle_model}")
+        elif strict:
+            result.add_error(f"Vehicle model file does not exist: {config.vehicle_model}")
+        else:
+            result.add_warning(f"Vehicle model file does not exist: {config.vehicle_model}")
+
+    if not config.plate_model.strip():
+        result.add_error("ANPR_PLATE_MODEL must be configured.")
+    else:
+        plate_path = Path(config.plate_model)
+        if plate_path.is_file():
+            result.add_info(f"OK: plate model found: {config.plate_model}")
+        elif strict:
+            result.add_error(f"Plate model file does not exist: {config.plate_model}")
+        else:
+            result.add_warning(f"Plate model file does not exist: {config.plate_model}")
+
+
+def _validate_inference(config: Config, result: ValidationResult) -> None:
+    if config.device not in VALID_DEVICES:
+        result.add_error(
+            f"ANPR_DEVICE must be one of {', '.join(sorted(VALID_DEVICES))}; got '{config.device}'."
+        )
+    else:
+        result.add_info(f"OK: inference device configured: {config.device}")
+
+    if config.target_fps <= 0:
+        result.add_error(f"ANPR_TARGET_FPS must be > 0; got {config.target_fps}.")
+    if not 0.0 <= config.vehicle_conf <= 1.0:
+        result.add_error(f"ANPR_VEHICLE_CONF must be between 0 and 1; got {config.vehicle_conf}.")
+    if not 0.0 <= config.plate_conf <= 1.0:
+        result.add_error(f"ANPR_PLATE_CONF must be between 0 and 1; got {config.plate_conf}.")
+    if config.vehicle_crop_padding_ratio < 0:
+        result.add_error(
+            "ANPR_VEHICLE_CROP_PADDING_RATIO must be >= 0; "
+            f"got {config.vehicle_crop_padding_ratio}."
+        )
+    if config.motorcycle_crop_padding_ratio < 0:
+        result.add_error(
+            "ANPR_MOTORCYCLE_CROP_PADDING_RATIO must be >= 0; "
+            f"got {config.motorcycle_crop_padding_ratio}."
+        )
+    if config.plate_fallback_max_distance_ratio <= 0:
+        result.add_error(
+            "ANPR_PLATE_FALLBACK_MAX_DISTANCE_RATIO must be > 0; "
+            f"got {config.plate_fallback_max_distance_ratio}."
+        )
+    if not 0.0 < config.track_iou_threshold <= 1.0:
+        result.add_error(
+            f"ANPR_TRACK_IOU_THRESHOLD must be > 0 and <= 1; got {config.track_iou_threshold}."
+        )
+    else:
+        result.add_info(f"OK: track IoU threshold configured: {config.track_iou_threshold}")
+    if config.track_expiry_seconds > 0:
+        result.add_info(f"OK: track expiry seconds configured: {config.track_expiry_seconds}")
+    if config.track_expiry_seconds <= 0:
+        result.add_error(
+            f"ANPR_TRACK_EXPIRY_SECONDS must be > 0; got {config.track_expiry_seconds}."
+        )
+    if config.early_finalize_min_votes < 1:
+        result.add_error(
+            f"ANPR_EARLY_FINALIZE_MIN_VOTES must be >= 1; got {config.early_finalize_min_votes}."
+        )
+    if not 0.0 < config.early_finalize_min_confidence <= 1.0:
+        result.add_error(
+            "ANPR_EARLY_FINALIZE_MIN_CONFIDENCE must be > 0 and <= 1; "
+            f"got {config.early_finalize_min_confidence}."
+        )
+    if config.min_plate_votes < 1:
+        result.add_error(f"ANPR_MIN_PLATE_VOTES must be >= 1; got {config.min_plate_votes}.")
+    if not 0.0 <= config.min_ocr_confidence <= 1.0:
+        result.add_error(
+            f"ANPR_MIN_OCR_CONFIDENCE must be between 0 and 1; got {config.min_ocr_confidence}."
+        )
+    if config.duplicate_cooldown_seconds < 0:
+        result.add_error(
+            "ANPR_DUPLICATE_COOLDOWN_SECONDS must be >= 0; "
+            f"got {config.duplicate_cooldown_seconds}."
+        )
+    else:
+        result.add_info(
+            f"OK: duplicate cooldown seconds configured: {config.duplicate_cooldown_seconds}"
+        )
+
+    if config.max_seconds is not None and config.max_seconds <= 0:
+        result.add_error(f"--max-seconds must be > 0; got {config.max_seconds}.")
+
+
+def _validate_m11_runtime(config: Config, result: ValidationResult) -> None:
+    if config.rtsp_reconnect_initial_delay_seconds <= 0:
+        result.add_error(
+            "ANPR_RTSP_RECONNECT_INITIAL_DELAY_SECONDS must be > 0; "
+            f"got {config.rtsp_reconnect_initial_delay_seconds}."
+        )
+    if config.rtsp_reconnect_max_delay_seconds < config.rtsp_reconnect_initial_delay_seconds:
+        result.add_error(
+            "ANPR_RTSP_RECONNECT_MAX_DELAY_SECONDS must be >= "
+            "ANPR_RTSP_RECONNECT_INITIAL_DELAY_SECONDS."
+        )
+    if config.rtsp_read_failure_limit < 1:
+        result.add_error(
+            f"ANPR_RTSP_READ_FAILURE_LIMIT must be >= 1; got {config.rtsp_read_failure_limit}."
+        )
+    if config.rtsp_health_log_interval_seconds <= 0:
+        result.add_error(
+            "ANPR_RTSP_HEALTH_LOG_INTERVAL_SECONDS must be > 0; "
+            f"got {config.rtsp_health_log_interval_seconds}."
+        )
+    if config.backend_queue_flush_interval_seconds <= 0:
+        result.add_error(
+            "ANPR_BACKEND_QUEUE_FLUSH_INTERVAL_SECONDS must be > 0; "
+            f"got {config.backend_queue_flush_interval_seconds}."
+        )
+    if config.rtsp_reconnect_max_attempts < 0:
+        result.add_error(
+            "ANPR_RTSP_RECONNECT_MAX_ATTEMPTS must be >= 0 (0 = unlimited); "
+            f"got {config.rtsp_reconnect_max_attempts}."
+        )
+
+    if config.source == "rtsp":
+        result.add_info(
+            f"OK: RTSP reconnect enabled={config.rtsp_reconnect_enabled} "
+            f"(max attempts={config.rtsp_reconnect_max_attempts or 'unlimited'})"
+        )
+        result.add_info(
+            f"OK: RTSP health log interval: {config.rtsp_health_log_interval_seconds}s"
+        )
+    if config.backend_enabled:
+        result.add_info(
+            "OK: backend queue flush interval: "
+            f"{config.backend_queue_flush_interval_seconds}s"
+        )
+
+
+def _validate_ocr(config: Config, result: ValidationResult, strict: bool) -> None:
+    if config.ocr_engine not in VALID_OCR_ENGINES:
+        result.add_error(
+            f"ANPR_OCR_ENGINE must be one of {', '.join(sorted(VALID_OCR_ENGINES))}; "
+            f"got '{config.ocr_engine}'."
+        )
+    else:
+        result.add_info(f"OK: OCR engine configured: {config.ocr_engine}")
+
+    if config.ocr_scale <= 0:
+        result.add_error(f"ANPR_OCR_SCALE must be > 0; got {config.ocr_scale}.")
+    else:
+        result.add_info(f"OK: OCR preprocess scale configured: {config.ocr_scale}")
+
+    if config.ocr_min_interval_seconds < 0:
+        result.add_error(
+            "ANPR_OCR_MIN_INTERVAL_SECONDS must be >= 0; "
+            f"got {config.ocr_min_interval_seconds}."
+        )
+    elif config.ocr_min_interval_seconds == 0:
+        result.add_info("OK: OCR throttle disabled (ANPR_OCR_MIN_INTERVAL_SECONDS=0)")
+    else:
+        result.add_info(
+            "OK: OCR min interval seconds configured: "
+            f"{config.ocr_min_interval_seconds}"
+        )
+
+    if importlib.util.find_spec("paddleocr") is None:
+        message = "PaddleOCR package is not installed (pip install -r requirements.txt)."
+        if strict:
+            result.add_error(message)
+        else:
+            result.add_warning(message)
+    else:
+        result.add_info("OK: PaddleOCR package is installed")
+
+
+def _warn_deprecated_backend_env(result: ValidationResult) -> None:
+    """Emit migration warnings when legacy backend identity variables are still set."""
+    env = _merged_env()
+    if parse_optional_str(env.get("ANPR_BACKEND_EMAIL")):
+        result.add_warning(
+            "ANPR_BACKEND_EMAIL is deprecated and ignored. Use ANPR_CAMERA_EMAIL for camera login."
+        )
+    if parse_optional_str(env.get("ANPR_BACKEND_PASSWORD")):
+        result.add_warning(
+            "ANPR_BACKEND_PASSWORD is deprecated and ignored. Use ANPR_CAMERA_PASSWORD for camera login."
+        )
+    if parse_optional_str(env.get("ANPR_BACKEND_CAMERA_ID")):
+        result.add_warning(
+            "ANPR_BACKEND_CAMERA_ID is deprecated and ignored. "
+            "Camera identity is derived from camera login."
+        )
+
+
+def _validate_backend(config: Config, result: ValidationResult) -> None:
+    cache_dir = Path(".cache")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        result.add_info("OK: .cache directory ready")
+    except OSError as exc:
+        result.add_error(f"Cannot create .cache directory: {exc}")
+
+    _warn_deprecated_backend_env(result)
+
+    if not config.backend_enabled:
+        result.add_info("OK: backend disabled; credentials not required")
+        return
+
+    required_fields = {
+        "ANPR_BACKEND_BASE_URL": config.backend_base_url,
+        "ANPR_CAMERA_EMAIL": config.camera_email,
+        "ANPR_CAMERA_PASSWORD": config.camera_password,
+        "ANPR_BACKEND_TOKEN_CACHE": config.backend_token_cache,
+        "ANPR_BACKEND_QUEUE_FILE": config.backend_queue_file,
+    }
+    for name, value in required_fields.items():
+        if value is None or str(value).strip() == "":
+            result.add_error(f"{name} is required when ANPR_BACKEND_ENABLED=true.")
+
+    if config.camera_email:
+        result.add_info(f"OK: camera email configured: {config.camera_email}")
+    if config.camera_password:
+        result.add_info("OK: camera password configured")
+
+    if not config.rtsp_url.strip():
+        result.add_error(
+            "ANPR_RTSP_URL is required when ANPR_BACKEND_ENABLED=true "
+            "(reported to the backend during camera login)."
+        )
+    elif not is_plausible_rtsp_url(config.rtsp_url):
+        result.add_error("ANPR_RTSP_URL is not plausible. Check .env.")
+    else:
+        result.add_info(f"OK: camera RTSP URL configured ({mask_rtsp_url(config.rtsp_url)})")
+
+    if config.backend_retry_limit < 0:
+        result.add_error(
+            f"ANPR_BACKEND_RETRY_LIMIT must be >= 0; got {config.backend_retry_limit}."
+        )
+    else:
+        result.add_info(
+            f"OK: backend retry limit configured: {config.backend_retry_limit} "
+            f"(max {config.backend_retry_limit + 1} attempt(s) per job)"
+        )
+
+    if config.backend_timeout_seconds <= 0:
+        result.add_error(
+            f"ANPR_BACKEND_TIMEOUT_SECONDS must be > 0; got {config.backend_timeout_seconds}."
+        )
+    else:
+        result.add_info(
+            f"OK: backend timeout seconds configured: {config.backend_timeout_seconds}"
+        )
+
+
+def _validate_evidence_mode(config: Config, result: ValidationResult) -> None:
+    if config.evidence_mode not in VALID_EVIDENCE_MODES:
+        result.add_error(
+            f"ANPR_EVIDENCE_MODE must be one of {', '.join(sorted(VALID_EVIDENCE_MODES))}; "
+            f"got '{config.evidence_mode}'."
+        )
+        return
+
+    result.add_info(f"OK: evidence mode configured: {config.evidence_mode}")
+
+    if config.evidence_mode == "upload" and config.backend_enabled:
+        result.add_info(
+            "OK: upload mode will send evidence files to Laravel-owned storage."
+        )
+
+    if config.evidence_mode == "metadata":
+        project_root = config.project_root_path()
+        result.add_info(
+            f"OK: metadata mode stores evidence paths relative to project root ({project_root})"
+        )
+        if config.backend_enabled:
+            result.add_warning(
+                "Metadata mode sends local evidence paths. Laravel must resolve those paths "
+                "through ANPR_IMAGE_ROOTS. Use upload mode for cloud backend deployment."
+            )
+
+    if config.delete_local_after_upload:
+        if config.evidence_mode == "upload":
+            result.add_info(
+                "OK: local evidence will be deleted after successful upload when "
+                "ANPR_DELETE_LOCAL_AFTER_UPLOAD=true."
+            )
+        elif config.evidence_mode == "metadata":
+            result.add_warning(
+                "ANPR_DELETE_LOCAL_AFTER_UPLOAD is ignored in metadata mode because the backend "
+                "may still depend on local evidence paths."
+            )
+
+
+def _validate_evidence_retention(config: Config, result: ValidationResult) -> None:
+    if config.evidence_retention_days < 0:
+        result.add_error(
+            f"ANPR_EVIDENCE_RETENTION_DAYS must be >= 0; got {config.evidence_retention_days}."
+        )
+        return
+
+    if config.evidence_retention_days == 0:
+        result.add_info("OK: local evidence retention: keep indefinitely (0 days)")
+    else:
+        result.add_info(
+            f"OK: local evidence retention: delete evidence in runs older than "
+            f"{config.evidence_retention_days} day(s) (never the current run)"
+        )
+
+
+def validate_backend_config(config: Config) -> ValidationResult:
+    """Validate only backend queue/posting settings (no models, OCR, or source checks)."""
+    result = ValidationResult()
+    cache_dir = Path(".cache")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        result.add_info("OK: .cache directory ready")
+    except OSError as exc:
+        result.add_error(f"Cannot create .cache directory: {exc}")
+
+    _warn_deprecated_backend_env(result)
+
+    if not config.backend_enabled:
+        result.add_info("OK: backend disabled; credentials not required")
+        return result
+
+    _validate_backend(config, result)
+    _validate_evidence_mode(config, result)
+    _validate_evidence_retention(config, result)
+    _validate_m11_runtime(config, result)
+    return result
+
+
+def validate_config(config: Config, *, strict: bool = False) -> ValidationResult:
+    """
+    Validate full configuration.
+
+    In strict mode, missing model files are fatal errors.
+    In standard mode, missing model files are warnings.
+    """
+    result = check_foundation_config(config)
+    if not result.ok:
+        return result
+
+    _validate_source(config, result)
+    _validate_models(config, result, strict=strict)
+    _validate_inference(config, result)
+    _validate_ocr(config, result, strict=strict)
+    _validate_backend(config, result)
+    _validate_evidence_mode(config, result)
+    _validate_evidence_retention(config, result)
+    _validate_m11_runtime(config, result)
+    return result
+
+
+def format_validation_output(result: ValidationResult) -> str:
+    """Format validation messages for CLI display."""
+    lines: list[str] = []
+    for message in result.info:
+        lines.append(message)
+    for message in result.warnings:
+        lines.append(f"WARNING: {message}")
+    for message in result.errors:
+        lines.append(f"ERROR: {message}")
+    return "\n".join(lines)

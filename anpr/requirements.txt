@@ -1,0 +1,5 @@
+opencv-python
+numpy
+ultralytics
+paddlepaddle<3
+paddleocr<3

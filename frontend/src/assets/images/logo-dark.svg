@@ -1,0 +1,10 @@
+<svg width="220" height="44" viewBox="0 0 220 44" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <g>
+    <path d="M22 2L39 9V20.5C39 30.2 31.8 38.7 22 42C12.2 38.7 5 30.2 5 20.5V9L22 2Z" fill="#0F172A"/>
+    <path d="M22 6.8L35 12.1V20.3C35 28.2 29.3 35.1 22 37.7C14.7 35.1 9 28.2 9 20.3V12.1L22 6.8Z" fill="#2563EB"/>
+    <path d="M16.3 21.8L20.2 25.8L28.7 17.3" stroke="#F8FAFC" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="31.2" cy="13.5" r="2.4" fill="#22D3EE"/>
+  </g>
+  <text x="50" y="20" fill="#F8FAFC" font-family="Inter, Roboto, Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="0.4">VeriPatrol</text>
+  <text x="50" y="34" fill="#CBD5E1" font-family="Inter, Roboto, Arial, sans-serif" font-size="10" font-weight="500" letter-spacing="0.4">AI Patrol Verification</text>
+</svg>

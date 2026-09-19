@@ -1,0 +1,380 @@
+<?php
+
+namespace Tests\Unit\Blockchain;
+
+use App\Jobs\AnchorBlockchainRecordJob;
+use App\Models\AnprEvent;
+use App\Models\AnprImage;
+use App\Models\BlockchainRecord;
+use App\Models\Camera;
+use App\Services\Blockchain\BlockchainHashService;
+use App\Services\Blockchain\BlockchainRecordService;
+use App\Services\Blockchain\BlockchainRetryService;
+use Carbon\Carbon;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\File;
+use InvalidArgumentException;
+use PHPUnit\Framework\Attributes\DataProvider;
+use Tests\TestCase;
+
+class BlockchainRecordServiceTest extends TestCase
+{
+    use RefreshDatabase;
+
+    private BlockchainRecordService $service;
+
+    private string $imageRoot;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->imageRoot = storage_path('framework/testing/blockchain-record');
+        File::ensureDirectoryExists($this->imageRoot);
+        config(['anpr.image_roots' => [$this->imageRoot]]);
+
+        config([
+            'blockchain.enabled' => false,
+            'blockchain.canonical_version' => 'v1',
+            'blockchain.hash_algorithm' => 'sha256',
+            'blockchain.network' => 'ganache',
+            'blockchain.environment' => 'local',
+            'blockchain.chain_id' => 1337,
+            'blockchain.contract_address' => '0x'.str_repeat('a', 40),
+        ]);
+
+        $this->service = new BlockchainRecordService(app(BlockchainHashService::class), new BlockchainRetryService);
+    }
+
+    protected function tearDown(): void
+    {
+        if (File::isDirectory($this->imageRoot)) {
+            File::deleteDirectory($this->imageRoot);
+        }
+
+        parent::tearDown();
+    }
+
+    public function test_creates_pending_blockchain_record_for_anpr_event(): void
+    {
+        $event = $this->createAnprEvent();
+
+        $record = $this->service->createForEntity($event);
+
+        $this->assertInstanceOf(BlockchainRecord::class, $record);
+        $this->assertSame('pending', $record->status);
+        $this->assertDatabaseHas('blockchain_records', [
+            'id' => $record->id,
+            'entity_type' => 'anpr_event',
+            'entity_id' => $event->id,
+            'status' => 'pending',
+        ]);
+    }
+
+    public function test_persists_m4_hash_metadata_on_created_record(): void
+    {
+        $event = $this->createAnprEvent([
+            'plate_number' => 'ABC1234',
+            'confidence' => 0.9200,
+            'detection_time' => Carbon::parse('2026-06-21T10:00:00Z'),
+        ]);
+
+        $expectedHash = app(BlockchainHashService::class)->hashEntity($event);
+        $record = $this->service->createForEntity($event);
+
+        $this->assertSame($expectedHash['record_hash'], $record->record_hash);
+        $this->assertSame('v1', $record->canonical_version);
+        $this->assertSame('sha256', $record->hash_algorithm);
+        $this->assertSame('entity_created', $record->proof_type);
+    }
+
+    public function test_stores_configured_network_environment_and_chain_metadata(): void
+    {
+        config([
+            'blockchain.network' => 'ganache',
+            'blockchain.environment' => 'local',
+            'blockchain.chain_id' => 1337,
+            'blockchain.contract_address' => '0x'.str_repeat('b', 40),
+        ]);
+
+        $record = $this->service->createForEntity($this->createAnprEvent());
+
+        $this->assertSame('ganache', $record->network);
+        $this->assertSame('local', $record->environment);
+        $this->assertSame(1337, $record->chain_id);
+        $this->assertSame('0x'.str_repeat('b', 40), $record->contract_address);
+    }
+
+    #[DataProvider('configuredChainIdNormalizationProvider')]
+    public function test_configured_chain_id_is_normalized_before_persisting(mixed $configuredValue, ?int $expectedChainId): void
+    {
+        config(['blockchain.chain_id' => $configuredValue]);
+
+        $record = $this->service->createForEntity($this->createAnprEvent());
+
+        $this->assertSame($expectedChainId, $record->chain_id);
+    }
+
+    /**
+     * @return array<string, array{0: mixed, 1: ?int}>
+     */
+    public static function configuredChainIdNormalizationProvider(): array
+    {
+        return [
+            'malformed string' => ['not-a-number', null],
+            'empty string' => ['', null],
+            'zero integer' => [0, null],
+            'negative integer' => [-1, null],
+            'positive numeric string' => ['1337', 1337],
+        ];
+    }
+
+    public function test_creates_safe_payload_summary_for_anpr_event(): void
+    {
+        $event = $this->createAnprEvent([
+            'plate_number' => 'ABC1234',
+            'confidence' => 0.9200,
+            'detection_time' => Carbon::parse('2026-06-21T10:00:00Z'),
+            'is_valid' => true,
+            'is_flagged' => false,
+        ]);
+
+        $record = $this->service->createForEntity($event);
+
+        $this->assertSame([
+            'module' => 'anpr',
+            'entity_type' => 'anpr_event',
+            'entity_id' => (string) $event->id,
+            'proof_type' => 'entity_created',
+            'plate_number' => 'ABC1234',
+            'camera_id' => (string) $event->camera_id,
+            'detection_time' => '2026-06-21T10:00:00Z',
+            'confidence' => '0.9200',
+            'is_valid' => true,
+            'is_flagged' => false,
+        ], $record->payload_summary);
+    }
+
+    public function test_payload_summary_excludes_sensitive_or_volatile_fields(): void
+    {
+        $event = $this->createAnprEvent([
+            'latitude' => 3.1415927,
+            'longitude' => 101.6868550,
+        ]);
+
+        $record = $this->service->createForEntity($event);
+        $summary = $record->payload_summary;
+
+        $this->assertIsArray($summary);
+        $this->assertArrayNotHasKey('canonical_json', $summary);
+        $this->assertArrayNotHasKey('private_key', $summary);
+        $this->assertArrayNotHasKey('rpc_url', $summary);
+        $this->assertArrayNotHasKey('latitude', $summary);
+        $this->assertArrayNotHasKey('longitude', $summary);
+        $this->assertArrayNotHasKey('vehicle_id', $summary);
+    }
+
+    public function test_duplicate_proof_creation_is_idempotent(): void
+    {
+        $event = $this->createAnprEvent();
+
+        $first = $this->service->createForEntity($event);
+        $second = $this->service->createForEntity($event);
+
+        $this->assertTrue($first->is($second));
+        $this->assertSame(1, BlockchainRecord::query()->count());
+    }
+
+    public function test_different_proof_types_create_different_records(): void
+    {
+        $event = $this->createAnprEvent();
+
+        $created = $this->service->createForEntity($event, 'entity_created');
+        $updated = $this->service->createForEntity($event, 'entity_updated');
+
+        $this->assertNotSame($created->id, $updated->id);
+        $this->assertSame('entity_created', $created->proof_type);
+        $this->assertSame('entity_updated', $updated->proof_type);
+        $this->assertSame(2, BlockchainRecord::query()->count());
+    }
+
+    public function test_unsupported_entities_surface_hash_service_exception(): void
+    {
+        $camera = Camera::factory()->create();
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported entity class for blockchain hashing: App\Models\Camera');
+
+        $this->service->createForEntity($camera);
+    }
+
+    public function test_updates_anpr_event_blockchain_record_id_when_empty(): void
+    {
+        $event = $this->createAnprEvent([
+            'blockchain_record_id' => null,
+        ]);
+
+        $record = $this->service->createForEntity($event);
+
+        $event->refresh();
+
+        $this->assertSame($record->id, $event->blockchain_record_id);
+    }
+
+    public function test_does_not_overwrite_existing_anpr_event_blockchain_record_id(): void
+    {
+        $event = $this->createAnprEvent([
+            'blockchain_record_id' => null,
+        ]);
+        $existingLink = BlockchainRecord::factory()->create();
+        $event->update(['blockchain_record_id' => $existingLink->id]);
+
+        $record = $this->service->createForEntity($event);
+
+        $event->refresh();
+
+        $this->assertSame($existingLink->id, $event->blockchain_record_id);
+        $this->assertNotSame($existingLink->id, $record->id);
+    }
+
+    public function test_does_not_dispatch_jobs_or_call_ethereum(): void
+    {
+        Bus::fake();
+
+        $this->service->createForEntity($this->createAnprEvent());
+
+        Bus::assertNotDispatched(AnchorBlockchainRecordJob::class);
+        $this->assertSame(0, BlockchainRecord::query()->whereNotNull('tx_hash')->count());
+    }
+
+    public function test_dispatches_anchor_job_when_blockchain_is_enabled(): void
+    {
+        Bus::fake();
+
+        config(['blockchain.enabled' => true]);
+
+        $record = $this->service->createForEntity($this->createAnprEvent());
+
+        $this->assertSame('queued', $record->status);
+        Bus::assertDispatched(AnchorBlockchainRecordJob::class, function (AnchorBlockchainRecordJob $job) use ($record): bool {
+            return $job->blockchainRecordId === $record->id;
+        });
+    }
+
+    public function test_creates_pending_records_when_blockchain_is_disabled(): void
+    {
+        config(['blockchain.enabled' => false]);
+
+        $record = $this->service->createForEntity($this->createAnprEvent());
+
+        $this->assertSame('pending', $record->status);
+        $this->assertNull($record->tx_hash);
+    }
+
+    public function test_creates_safe_payload_summary_for_anpr_image(): void
+    {
+        $relativePath = 'evidence/summary.jpg';
+        $absolutePath = $this->imageRoot.DIRECTORY_SEPARATOR.$relativePath;
+        File::ensureDirectoryExists(dirname($absolutePath));
+        File::put($absolutePath, 'summary-image');
+
+        $image = AnprImage::factory()->create([
+            'file_path' => $relativePath,
+            'file_size' => 13,
+            'resolution' => '640x480',
+        ]);
+
+        $record = $this->service->createForEntity($image, 'evidence_file');
+
+        $this->assertSame('anpr_image', $record->payload_summary['entity_type']);
+        $this->assertSame('evidence_file', $record->payload_summary['proof_type']);
+        $this->assertSame('file', $record->payload_summary['evidence_hash_source']);
+        $this->assertSame($relativePath, $record->payload_summary['file_path']);
+    }
+
+    public function test_duplicate_anpr_image_proof_creation_is_idempotent(): void
+    {
+        $image = AnprImage::factory()->create([
+            'file_path' => 'evidence/idempotent.jpg',
+        ]);
+
+        $first = $this->service->createForEntity($image, 'evidence_file');
+        $second = $this->service->createForEntity($image, 'evidence_file');
+
+        $this->assertTrue($first->is($second));
+        $this->assertSame(1, BlockchainRecord::query()->where('entity_type', 'anpr_image')->count());
+    }
+
+    public function test_create_for_payload_persists_record_and_reuses_exact_duplicate(): void
+    {
+        Bus::fake();
+        config(['blockchain.enabled' => true]);
+
+        $payload = [
+            'entity_type' => 'user_profile',
+            'entity_id' => '01940000-0000-7000-8000-000000000101',
+            'proof_type' => 'profile_password_changed',
+            'profile_version' => 3,
+            'changed_at' => '2026-06-29T10:00:00Z',
+            'actor_user_id' => '01940000-0000-7000-8000-000000000101',
+            'revoked_count' => 1,
+            'source' => 'self_profile',
+        ];
+
+        $first = $this->service->createForPayload($payload, $payload);
+        $second = $this->service->createForPayload($payload, $payload);
+
+        $this->assertTrue($first->is($second));
+        $this->assertSame(1, BlockchainRecord::query()->where('entity_type', 'user_profile')->count());
+        Bus::assertDispatchedTimes(AnchorBlockchainRecordJob::class, 1);
+    }
+
+    public function test_create_for_payload_allows_multiple_user_profile_proofs_with_different_hashes(): void
+    {
+        $userId = '01940000-0000-7000-8000-000000000202';
+        $base = [
+            'entity_type' => 'user_profile',
+            'entity_id' => $userId,
+            'proof_type' => 'profile_password_changed',
+            'changed_at' => '2026-06-29T10:00:00Z',
+            'actor_user_id' => $userId,
+            'revoked_count' => 1,
+            'source' => 'self_profile',
+        ];
+
+        $first = $this->service->createForPayload(array_merge($base, ['profile_version' => 2]), $base);
+        $second = $this->service->createForPayload(array_merge($base, ['profile_version' => 3]), $base);
+
+        $this->assertNotSame($first->id, $second->id);
+        $this->assertSame(2, BlockchainRecord::query()->where('entity_type', 'user_profile')->count());
+    }
+
+    public function test_create_for_payload_normalizes_datetime_payload_summary_for_verification(): void
+    {
+        $changedAt = Carbon::parse('2026-06-29T10:00:00Z');
+        $payload = [
+            'entity_type' => 'user_profile',
+            'entity_id' => '01940000-0000-7000-8000-000000000303',
+            'proof_type' => 'profile_password_changed',
+            'profile_version' => 4,
+            'changed_at' => $changedAt,
+            'actor_user_id' => '01940000-0000-7000-8000-000000000303',
+            'revoked_count' => 1,
+            'source' => 'self_profile',
+        ];
+
+        $record = $this->service->createForPayload($payload, $payload);
+
+        $this->assertSame('2026-06-29T10:00:00Z', $record->payload_summary['changed_at']);
+        $this->assertIsString($record->payload_summary['changed_at']);
+    }
+
+    /**
+     * @param  array<string, mixed>  $overrides
+     */
+    private function createAnprEvent(array $overrides = []): AnprEvent
+    {
+        return AnprEvent::factory()->create($overrides);
+    }
+}

@@ -1,0 +1,1810 @@
+# Backend Laravel API — Technical Documentation
+
+This document describes the `**backend**` Laravel application as implemented in the repository. It is intended for developers and maintainers. Where something cannot be inferred from the codebase, it is stated explicitly.
+
+## Current contract
+
+| Field | Value |
+|---|---|
+| **Status** | Implemented — aligned with repository runtime |
+| **Last audited** | 2026-07-21 |
+| **Canonical precedence** | This file and `routes/api.php` override milestone snapshots and planning-only text in [`../docs/login-module.md`](../docs/login-module.md) / [`../docs/profile-module.md`](../docs/profile-module.md). Patrol movement: [`../docs/system-update/patrol-location-logs-canonical-movement.md`](../docs/system-update/patrol-location-logs-canonical-movement.md). Account Settings: [`../docs/system-update/m6-account-settings-two-tab-redesign.md`](../docs/system-update/m6-account-settings-two-tab-redesign.md). |
+| **Historical policy** | Milestone appendix notes marked *at Mx* or wrapped in *Historical milestone snapshot* banners describe point-in-time state only — not current behavior. |
+| **Known manual tasks** | Re-audit after profile or patrol-movement changes; run `php artisan test` focused filters before release demos. |
+
+**Documentation audit:** Last aligned with implementation **2026-07-21**. Login Module (M0–M10), Profile Module (M0–M15), camera-authenticated ANPR (M1–M2), dashboard summary (M10), and patrol validation tuning (M8) are **implemented** in this codebase.
+
+---
+
+## Table of contents
+
+1. [Project overview](#1-project-overview)
+2. [System architecture](#2-system-architecture)
+3. [Directory structure](#3-directory-structure)
+4. [API documentation](#4-api-documentation)
+5. [Database documentation](#5-database-documentation)
+6. [Authentication & authorization](#6-authentication--authorization)
+7. [Services & business logic](#7-services--business-logic)
+8. [Configuration](#8-configuration)
+9. [External integrations](#9-external-integrations)
+10. [Dependencies](#10-dependencies)
+11. [Deployment & environment setup](#11-deployment--environment-setup)
+12. [Automated test coverage](#12-automated-test-coverage)
+13. [Known issues / technical debt](#13-known-issues--technical-debt)
+
+---
+
+## 1. Project overview
+
+### Purpose
+
+The application is a **JSON API backend** (Laravel) that supports:
+
+- **User and role management** (including soft deletes and restore).
+- **JWT-based authentication** for protected routes.
+- **Geographic / facility “zones”** with admin-only mutations; authenticated users can list/view zones.
+- **Checkpoint events** on patrol sessions (backend-derived validation results per checkpoint), exposed as JWT-protected CRUD under `/api/checkpoint-events`.
+- **Checkpoint event metrics** (one scoring breakdown per checkpoint event), exposed as JWT-protected CRUD under `/api/checkpoint-event-metrics`.
+- **Patrol location logs** (immutable, append-only GPS evidence tied to a patrol session and user), ingested and queried under `/api/location-logs` with JWT; **no** HTTP update or delete; **no** link to checkpoints.
+- **Patrol route presentation** (compatibility read endpoint): `**GET /api/patrol-routes**` returns drawable movement via `PatrolMovementService` (canonical **`location_logs`**; legacy **`patrol_routes`** fallback only). `**POST /api/patrol-routes**` is **deprecated** (prefer `POST /location-logs` or `POST /pwa/sync`).
+- **Realtime patrol monitoring** via **Laravel Reverb** (WebSockets): private channels `patrol.monitoring` and `patrol.session.{id}`; JWT auth at `**POST /api/broadcasting/auth`**; events fired from patrol session / route / checkpoint / validation flows (**REST unchanged\*\*).
+- **Blockchain record metadata** storage and querying (status, network, environment, entity linkage), aligned with concepts like Ganache/Sepolia and development/production environments.
+- **Camera records** for ANPR capture sources and machine authentication (**M1**): admin CRUD under `/api/cameras`; machine login under `/api/camera-auth/login` with separate camera JWT guard.
+- **Vehicle records** for watchlist/allowlist workflows with CRUD under `/api/vehicles`.
+- **ANPR events** for plate detections tied to cameras with optional vehicle linkage and backend-managed blockchain proof when `BLOCKCHAIN_ENABLED=true`; clients must not send `blockchain_record_id`. Exposed as JWT-protected CRUD under `/api/anpr-events` with **M10** list filters, safe nested camera serialization, and `AnprEventResource` responses.
+- **ANPR images** metadata for event-linked image assets (full/plate/annotated), exposed as JWT-protected CRUD under `/api/anpr-images`, multipart upload at `POST /api/anpr-events/{anpr_event}/images/upload` (M10), plus a protected file proxy at `GET /api/anpr-images/{id}/file` when paths resolve under configured `ANPR_IMAGE_ROOTS` (default `storage/app/anpr`).
+- **ANPR event logs** for event-linked processing/audit messages (`stage`, optional `message`), exposed as JWT-protected CRUD under `/api/anpr-event-logs` (audit/API only — not rendered in the M10 React monitoring UI).
+
+There is no separate SPA or mobile app in this repository; the default `package.json` only wires **Vite + Tailwind** for Laravel’s frontend build (e.g. `welcome` view), not a full product UI.
+
+### Core business functionality (from code)
+
+| Area                     | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Users                    | CRUD via API resources; optional `only_trashed` / `include_trashed` on index; soft delete; restore endpoint.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Roles                    | Read-only listing and show (no create/update/delete routes).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Auth                     | Multi-step login: password → mandatory TOTP setup (first login) → OTP on every login. JWT access token + HttpOnly refresh cookie issued only after OTP or 2FA setup verify. Refresh rotation with family reuse detection (`RefreshTokenService`). Session list/revoke APIs. Admin audit logs and 2FA reset. See [§6](#6-authentication--authorization). |
+| Zones                    | Full REST under `auth:api`; create/update/delete require role name exactly `**Admin`\*\*; responses include `checkpoints_count` derived from related checkpoints.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Checkpoints              | Full REST under `auth:api`; supports pagination, filtering (`zone_id`, `is_active`, `location_type`), and name search.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Patrol sessions          | Full REST under `auth:api`; supports pagination, filtering (`user_id`, `zone_id`, `status`), and sorting by `started_at`. `**GET /api/patrol-sessions/{id}/summary**` returns a gap-aware computed summary (not persisted). `**POST /api/patrol-sessions/{id}/validate**` runs the backend validation engine (Milestone 1): reconstructs movement from `location_logs`, scores checkpoints, persists `checkpoint_events` + `checkpoint_event_metrics`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Patrol routes            | `**GET` / `POST /api/patrol-routes**` under `auth:api`. **`GET`** (monitoring) returns drawable movement from canonical **`location_logs`** via `PatrolMovementService` (temporary **`patrol_routes`** fallback for legacy sessions with no usable logs). Pagination (`per_page` max **1000**, default **500**). **`POST`** is **deprecated** (Deprecation header; prefer `POST /location-logs` or `POST /pwa/sync`). See [`../docs/system-update/patrol-location-logs-canonical-movement.md`](../docs/system-update/patrol-location-logs-canonical-movement.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Checkpoint events        | Full REST under `auth:api`; backend stores **validation context** per checkpoint visit (`entered_at`, `exited_at`, `detected_at`, `processed_at`, `detection_type`, `confidence_score`, `status`); pagination; filtering (`patrol_session_id`, `checkpoint_id`, `status`, `detection_type`); sorting by `detected_at` (`latest` / `oldest`). Authoritative scores come from `**POST …/validate`\*\* (`PatrolValidationService`); PWA PATCH may still send provisional metadata during patrol. No foreign key to `location_logs`. No soft deletes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Checkpoint event metrics | Full REST under `auth:api`; one row per checkpoint event (unique `checkpoint_event_id`); scoring factors for explaining confidence; `calculated_confidence_score` returned via API resource only (not stored). No soft deletes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Location logs            | Canonical GPS evidence for live tracking, route display, replay, validation, and summaries. `index` / `store` / `show` under `auth:api` (**no** `update` or `destroy`). Pagination; filters `patrol_session_id`, `user_id`; sort by device `timestamp` (+ `created_at`, `id`). Successful `store` / `pwa/sync` emits compact `PatrolRouteUpdated` (broadcast failure does not fail persistence). Ingest passes through `LocationLogTimestampService`. See [`../docs/system-update/patrol-location-logs-canonical-movement.md`](../docs/system-update/patrol-location-logs-canonical-movement.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| PWA location sync        | `**POST /api/pwa/sync`** under `auth:api` — accepts queued `**location_log**`payloads (camelCase fields from the PWA client); stores rows in`**location_logs**`with client`**locationLogId\*\*` as primary key for idempotent replay. Duplicate device timestamps for the same patrol are bumped server-side before insert.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Cameras                  | Full REST under `auth:api`; CRUD camera records for ANPR/RTSP management with indexing on `is_active`, `ip_address`, and `last_seen_at`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Vehicles                 | **M13:** Admin-only REST under `auth:api` + `admin` middleware; UUID records keyed by `plate_number` uniqueness with status/source enums. `AnprVehicleResource` responses. Update allows `owner_name`, `vehicle_type`, `status`, `notes` only; `plate_number` and `source` are prohibited on update. Manual `POST` normalizes `plate_number` before create, rejects normalized duplicates via shared `AnprVehicleLinker` lookup, sets `source = manual` server-side (client `source` prohibited). ANPR ingestion auto-links vehicles via `AnprVehicleLinker` without requiring `/api/vehicles` access.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ANPR events              | Full REST under `auth:api`; stores plate detections with required `camera_id` and optional `vehicle_id`; `blockchain_record_id` is backend-managed (client-supplied value **prohibited** on create/update). When `BLOCKCHAIN_ENABLED=true`, Laravel auto-creates `anpr_event` / `entity_created` proof rows and queues anchoring; when disabled, ANPR behavior is unchanged. Indexed by plate/time/flags and FK columns. **M10:** `index` supports `per_page`, `page`, `plate_number`, `search`, `is_valid`, `is_flagged`, `date_from`, `date_to`, `camera_id`; responses use `AnprEventResource` with safe nested `camera` / `vehicle` / `images` (no `logs` eager-load on monitoring responses); event detail exposes lightweight `blockchain_proof` visibility (full blockchain dashboard is M11). **M12:** adds `sort`, `direction`, `since` for live polling; default order `detection_time` desc. **M13:** `store` auto-links/creates vehicles via `AnprVehicleLinker`; normalizes `plate_number`; sets `is_flagged` when linked vehicle status is `flagged`; AI does not send `vehicle_id`. **M13 hardening:** empty-after-normalization plates return 422; `PATCH` prohibits `vehicle_id`/`is_flagged`; plate change relinks vehicle and re-derives `is_flagged`. **M15:** `index` eager-loads `vehicle` and `camera` only, uses `withCount('images')`, and exposes `images_count`; `show` still loads full `images`. |
+| ANPR images              | Full REST CRUD under `auth:api`; stores ANPR image metadata with required `anpr_event_id`, `image_type` (`full`, `plate`, `annotated`), and `file_path`; optional file size/resolution/expiry; indexed by event/type/expiry. **M10:** `POST /api/anpr-events/{anpr_event}/images/upload` stores uploaded evidence under `storage/app/anpr`; idempotent replace by event + `image_type` is allowed **only before** any matching row has an `anpr_image` / `evidence_file` blockchain proof — after proof creation, evidence is immutable and replacement returns **409 Conflict** without storing or deleting files; when `BLOCKCHAIN_ENABLED=true`, auto-creates proof rows on first persist; direct image responses include safe `blockchain_proof` when a proof exists; `AnprImageResource` adds `url` / `image_url` when the file resolves; `GET /api/anpr-images/{anpr_image}/file` serves the binary via `AnprImageFileService` (path traversal rejected; default root `storage/app/anpr` when `ANPR_IMAGE_ROOTS` is empty). Proofed images reject canonical-field updates and delete with **409**.                                                                                                                                                                                                                                                                                                                      |
+| ANPR event logs          | Full REST under `auth:api`; stores ANPR event processing logs with required `anpr_event_id`, required `stage` (max 50), and optional `message`; indexed by event and stage. Used for AI-runtime audit; not consumed by the M10 frontend monitoring UI.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Blockchain records       | Read-only index (filters, sort, pagination) and show. **Admin only** (Security Operators and Guards forbidden). `show` includes related `jobs` and `verifications` when present. Demo seeding via `BlockchainRecordSeeder` is opt-in (`php artisan db:seed --class=BlockchainRecordSeeder`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+
+### Main modules / features
+
+- **API layer**: `routes/api.php`, controllers under `App\Http\Controllers\Api`.
+- **Domain models**: `User`, `Role`, `Zone`, `Checkpoint`, `PatrolSession`, `PatrolRoute`, `CheckpointEvent`, `CheckpointEventMetric`, `LocationLog`, `Camera`, `Vehicle`, `AnprEvent`, `AnprImage`, `AnprEventLog`, `BlockchainRecord`, `BlockchainJob`, and `BlockchainVerification`.
+- **Validation**: Form requests for users/zones/checkpoints/patrol-sessions/checkpoint-events/checkpoint-event-metrics/location-logs/patrol-routes/cameras (`StoreLocationLogRequest` only for location logs; `StorePatrolRouteRequest` for patrol breadcrumbs; `StoreCameraRequest` + `UpdateCameraRequest` for cameras); inline validation for auth login and some index query params.
+
+### Runtime versions (from `composer.json`)
+
+| Item                  | Value   |
+| --------------------- | ------- |
+| **PHP**               | `^8.3`  |
+| **Laravel framework** | `^13.0` |
+
+### Frontend / backend technologies
+
+| Layer                       | Technology                                                  |
+| --------------------------- | ----------------------------------------------------------- |
+| Backend                     | Laravel 13, PHP 8.3+                                        |
+| API auth                    | JWT via `php-open-source-saver/jwt-auth` (`auth:api` guard) |
+| Default DB (`.env.example`) | MySQL (`DB_CONNECTION=mysql`; connection details required) |
+| Asset pipeline              | Vite 8, Tailwind 4, `laravel-vite-plugin` (dev/build only)  |
+
+### Important Composer / NPM packages
+
+**Composer (production):**
+
+| Package                          | Role                         |
+| -------------------------------- | ---------------------------- |
+| `laravel/framework`              | Core framework               |
+| `php-open-source-saver/jwt-auth` | JWT guard and token issuance |
+| `laravel/tinker`                 | REPL (dev/ops)               |
+
+**Composer (development):** Faker, Pint, Pail, Pao, Collision, PHPUnit — standard Laravel testing and tooling.
+
+**NPM:** `vite`, `laravel-vite-plugin`, `tailwindcss`, `@tailwindcss/vite`, `concurrently` — asset building; used by Composer `dev` script alongside `php artisan serve` and queue listener.
+
+---
+
+## 2. System architecture
+
+### Overall architecture
+
+The app follows **Laravel’s MVC-oriented HTTP stack**:
+
+- **Routes** map HTTP verbs to **controllers**.
+- **Eloquent models** encapsulate persistence and relationships.
+- **Form requests** validate input for users, zones, checkpoints, patrol sessions, patrol route creation (`**StorePatrolRouteRequest`**), checkpoint events, checkpoint event metrics, location log creation, PWA `**location_log**` sync (`**SyncPwaLocationLogRequest\*\*`), and cameras.
+- **API resources** shape JSON for users, roles, zones, checkpoints, patrol sessions, patrol breadcrumbs (`**PatrolRouteResource`**), checkpoint events, checkpoint event metrics, location logs, blockchain records, and **ANPR** modules (`**AnprEventResource**`, `**AnprImageResource**`, `**AnprCameraResource**`, `**AnprVehicleResource\*\*`).
+- **Custom middleware** (`active.user`, `admin`, `patrol.monitoring`) enforce fully initialized users and role access on protected API routes. `active.user` rejects JWTs issued at or before the later of `last_password_changed_at` and `last_security_changed_at` (Profile M4). See [`docs/login/m8-route-guards-role-policies-and-middleware-hardening.md`](docs/login/m8-route-guards-role-policies-and-middleware-hardening.md).
+- **Global exception rendering** in `bootstrap/app.php` normalizes JSON errors for API/JSON clients (validation, auth, JWT, 404).
+
+There is an `**App\Services**` layer for auth, profile, patrol, ANPR, blockchain, dashboard, and push; **no** repository pattern. Domain **events** under `app/Events/Patrol/` and **queue jobs** under `app/Jobs/` support Reverb broadcasting and blockchain anchoring.
+
+### Blockchain module architecture (M0–M13)
+
+The Laravel backend remains the **source of truth** for operational data and blockchain **application** logic. Ethereum smart-contract tooling lives in the sibling folder **`../blockchain/`** (Solidity, Hardhat, ABI, deployment scripts)—**not** inside this Laravel tree.
+
+**M1 (Ethereum project):** Sibling repo contains compiled `EvidenceStore`, Hardhat tests, and Ganache deployment JSON.
+
+**M2 (Laravel database foundation):** `blockchain_records`, `blockchain_jobs`, `blockchain_verifications`; read-only blockchain APIs for **Admin only**; opt-in `BlockchainRecordSeeder`.
+
+**M3 (Configuration):** `config/blockchain.php`, `.env.example` `BLOCKCHAIN_*` variables, `BlockchainConfigValidator`, `php artisan blockchain:check-config`. Blockchain is **disabled by default**. Numeric `BLOCKCHAIN_*` settings are strictly validated when enabled (malformed non-integer strings are rejected).
+
+**M4 (Deterministic hashing):** `App\Support\BlockchainCanonicalJson` and `App\Services\Blockchain\BlockchainHashService`. Produces stable canonical JSON and SHA-256 `record_hash` values for supported entities (`AnprEvent` v1 payload).
+
+**M5 (Record service and read APIs):** `App\Services\Blockchain\BlockchainRecordService` creates idempotent `blockchain_records` rows using M4 hashing. Safe `payload_summary` only. Read APIs: `GET /api/blockchain-records`, `GET /api/blockchain-records/{id}` (**Admin only**). No public create/update/delete endpoints.
+
+**M6 (Ganache anchoring):** `App\Services\Blockchain\EthereumRpcClient` and `App\Jobs\AnchorBlockchainRecordJob`. When `BLOCKCHAIN_ENABLED=true`, new/existing `pending` records are queued and anchored to Ganache `EvidenceStore.storeHash(bytes32)` via JSON-RPC. Persists `tx_hash`, `block_number`, `confirmations`, `submitted_at`, `confirmed_at`.
+
+**M7 (Retry and failure handling):** `App\Services\Blockchain\BlockchainRetryService` provides exponential backoff (`BLOCKCHAIN_RETRY_BASE_SECONDS`), retry eligibility (`BLOCKCHAIN_MAX_RETRIES`), and centralized error sanitization. `AnchorBlockchainRecordJob` uses business-level retries (`$tries = 1` on the Laravel queue) with `retry_anchor` audit rows. Admin manual retry: `POST /api/blockchain-records/{id}/retry`.
+
+**M8 (Verification system):** `App\Services\Blockchain\BlockchainVerificationService` recomputes entity hashes, compares against `record_hash`, and calls `EthereumRpcClient::verifyHash()` via read-only `eth_call` when appropriate. Manual verification: `POST /api/blockchain-records/{id}/verify` (**Admin only**). Persists `blockchain_verifications` and `blockchain_jobs` (`job_type = verify`). Results: `valid`, `tampered`, `pending`, `failed`, `onchain_missing`.
+
+**M9 (Sepolia deployment):** Sibling `blockchain` deploys `EvidenceStore` to Sepolia (`deployments/sepolia/EvidenceStore.json`, chain ID `11155111`). Laravel supports Sepolia via `BLOCKCHAIN_NETWORK=sepolia` and `BLOCKCHAIN_MODE=testnet`. `EthereumRpcClient` submits `storeHash` through `eth_sendRawTransaction` using `EthereumTransactionSigner` (`web3p/ethereum-tx`; requires PHP `ext-gmp` for live signing). Ganache continues to use `eth_sendTransaction`. `BlockchainConfigValidator` requires wallet, private key, and chain ID `11155111` for Sepolia.
+
+**M10 (ANPR module integration):** `App\Services\Blockchain\BlockchainAnprIntegrationService` automatically creates proof rows when `BLOCKCHAIN_ENABLED=true` for `AnprEventController@store` (`entity_created`) and `AnprImageController@uploadForEvent` / `@store` (`evidence_file`). Uses existing `BlockchainRecordService` + `AnchorBlockchainRecordJob`; ANPR APIs do not wait for chain confirmation. When disabled, ANPR works normally with no automatic proofs or queue dispatch. Client `blockchain_record_id` is **prohibited** on ANPR create/update; linkage is backend-managed. Automatic proof failures are logged with sanitized errors and do not fail ANPR writes. `GET /api/anpr-events/{id}` and direct `AnprImageResource` responses expose safe `blockchain_proof` summaries when proofs exist. See `blockchain/docs/m10-anpr-module-integration.md`.
+
+**M11 (Blockchain monitoring frontend):** `GET /api/blockchain-records/summary` returns status counts and safe breakdowns for the React dashboard. `GET /api/blockchain-records` supports `search` (record hash, tx hash, entity ID) and `entity_type` without requiring `entity_id`. Full monitoring UI in `frontend/src/feature/blockchain-monitoring/`. See `blockchain/docs/m11-blockchain-monitoring-frontend.md`.
+
+**M12 (Patrol and profile integration):** `BlockchainPatrolIntegrationService` anchors patrol validation results after `POST /api/patrol-sessions/{id}/validate` (`entity_type = patrol_session`, `proof_type = validation_result`). Profile M13 (`ProfileBlockchainService`) was inspected and confirmed aligned — no duplicate profile work. See `blockchain/docs/m12-patrol-and-profile-future-integration.md`.
+
+**M13 (Final hardening and documentation):** Regression tests, failure-demo matrix, manual demo checklist, and documentation freeze across all repos. Implementation complete; demo **screenshots** remain a local capture task. See `blockchain/docs/m13-final-hardening-testing-and-documentation.md`.
+
+**Submitted confirmation refresh:** `status = submitted` means a transaction hash exists but required confirmations (`BLOCKCHAIN_CONFIRMATION_BLOCKS`) may not be met yet (common on Sepolia when set to `2+`). `BlockchainSubmittedRecordRefreshService` and `RefreshSubmittedBlockchainRecordJob` re-check existing `tx_hash` receipts only — they never resubmit `storeHash`. Insufficient confirmations schedule delayed `refresh_confirmation` jobs; stale Ganache txs missing from RPC may eventually fail after retry limits. Operator command: `php artisan blockchain:refresh-submitted --network=sepolia --environment=staging`. Manual API: `POST /api/blockchain-records/{id}/refresh` (**Admin only**). Use `BLOCKCHAIN_CONFIRMATION_BLOCKS=1` for Ganache demos; `2+` on Sepolia requires refresh/recheck after more blocks are mined.
+
+| Responsibility                   | Location in this repo                                 | Notes                                                                                                                                                                                                                    |
+| -------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Database proof rows              | `BlockchainRecord`, `blockchain_records`              | Read APIs exist; expanded M2 schema (`record_hash`, `proof_type`, statuses, etc.)                                                                                                                                        |
+| Job audit rows                   | `BlockchainJob`, `blockchain_jobs`                    | M6+ dispatch; M7 `retry_anchor` rows and `next_attempt_at`                                                                                                                                                               |
+| Verification rows                | `BlockchainVerification`, `blockchain_verifications`  | M8: `BlockchainVerificationService`; manual verify via `POST /api/blockchain-records/{id}/verify` and bulk `POST /api/blockchain-records/verify-all` (**Admin only**)                                                                                                                  |
+| Hashing, record, RPC, retry, verification services | `app/Services/Blockchain/`                            | M3: `BlockchainConfigValidator`; M4: `BlockchainHashService`; M5: `BlockchainRecordService`; M6: `EthereumRpcClient`; M7: `BlockchainRetryService`; M8: `BlockchainVerificationService`; M9: `EthereumTransactionSigner`; M10: `BlockchainAnprIntegrationService`; M12: `BlockchainPatrolIntegrationService`; profile: `ProfileBlockchainService` |
+| Config                           | `config/blockchain.php`, `.env` `BLOCKCHAIN_*`        | M3 complete; disabled by default; validate with `php artisan blockchain:check-config`                                                                                                                                    |
+| Queue jobs                       | `app/Jobs/AnchorBlockchainRecordJob.php`              | M6+ Ganache anchoring when `BLOCKCHAIN_ENABLED=true`; M7 business retries                                                                                                                                                |
+| Verification & dashboard APIs    | `app/Http/Controllers/Api/`, `app/Http/Resources/`    | M8 verify API; M7 admin retry; read APIs M5+                                                                                                                                                                             |
+| Automated tests                  | `tests/Feature/Blockchain/`, `tests/Unit/Blockchain/` | **156** blockchain tests total (M2–M8)                                                                                                                                                                                   |
+
+**Rules:**
+
+- **Do not** add Solidity, Hardhat, `node_modules`, or contract artifacts under `backend/`.
+- **Private keys** (`BLOCKCHAIN_PRIVATE_KEY`, wallet material) belong in server **`.env` only**—never in frontend, AI ANPR, Git, or public documentation.
+- **AI ANPR** and **React** call Laravel APIs only; they do not perform Ethereum RPC calls.
+- When `BLOCKCHAIN_ENABLED=true`, Laravel anchors hashes via `EthereumRpcClient` (M6). **Sepolia** testnet anchoring is supported (M9) with signed `eth_sendRawTransaction` when `BLOCKCHAIN_NETWORK=sepolia` and wallet credentials are configured.
+
+See also: [`../blockchain/blockchain-module.md`](../blockchain/blockchain-module.md), [`../blockchain/docs/m0-architecture-finalization-and-repository-split.md`](../blockchain/docs/m0-architecture-finalization-and-repository-split.md), [`../blockchain/docs/m1-ethereum-project-foundation.md`](../blockchain/docs/m1-ethereum-project-foundation.md), [`../blockchain/docs/m2-laravel-database-foundation.md`](../blockchain/docs/m2-laravel-database-foundation.md), [`../blockchain/docs/m3-configuration-and-environment-management.md`](../blockchain/docs/m3-configuration-and-environment-management.md), [`../blockchain/docs/m4-deterministic-hashing-architecture.md`](../blockchain/docs/m4-deterministic-hashing-architecture.md), [`../blockchain/docs/m5-blockchain-record-service-and-read-apis.md`](../blockchain/docs/m5-blockchain-record-service-and-read-apis.md), [`../blockchain/docs/m6-ganache-anchoring-end-to-end.md`](../blockchain/docs/m6-ganache-anchoring-end-to-end.md), [`../blockchain/docs/m7-retry-and-failure-handling.md`](../blockchain/docs/m7-retry-and-failure-handling.md), [`../blockchain/docs/m8-verification-system.md`](../blockchain/docs/m8-verification-system.md), [`../blockchain/docs/m9-sepolia-deployment.md`](../blockchain/docs/m9-sepolia-deployment.md), [`../blockchain/docs/m10-anpr-module-integration.md`](../blockchain/docs/m10-anpr-module-integration.md), [`../blockchain/docs/m11-blockchain-monitoring-frontend.md`](../blockchain/docs/m11-blockchain-monitoring-frontend.md), [`../blockchain/docs/m12-patrol-and-profile-future-integration.md`](../blockchain/docs/m12-patrol-and-profile-future-integration.md), and [`../blockchain/docs/m13-final-hardening-testing-and-documentation.md`](../blockchain/docs/m13-final-hardening-testing-and-documentation.md).
+
+### MVC and API flow
+
+```mermaid
+flowchart LR
+  Client[HTTP Client]
+  Routes[routes/api.php]
+  MW[Middleware auth:api / EnsureUserIsAdmin]
+  Ctrl[API Controllers]
+  Req[FormRequest / inline validate]
+  Model[Eloquent Models]
+  Res[JsonResource / manual JSON]
+
+  Client --> Routes
+  Routes --> MW
+  MW --> Ctrl
+  Ctrl --> Req
+  Ctrl --> Model
+  Ctrl --> Res
+  Res --> Client
+```
+
+### Request lifecycle (simplified)
+
+1. Request hits `public/index.php` → Laravel bootstrap (`bootstrap/app.php`).
+2. Router matches `routes/api.php` (prefix `**/api**` by framework convention).
+3. Middleware runs: e.g. `auth:api` on the `zones` / `checkpoints` / `patrol-sessions` / `checkpoint-events` / `checkpoint-event-metrics` / `location-logs` / `vehicles` group; `ZoneController` adds `auth:api` again in constructor and `EnsureUserIsAdmin` for `store` / `update` / `destroy`.
+4. Controller action runs (validation, queries, responses).
+5. Exceptions may be converted to JSON in `bootstrap/app.php` (`ValidationException`, `AuthenticationException`, `JWTException`, `ModelNotFoundException`, `NotFoundHttpException`).
+
+### Modular structure
+
+Unable to determine from current implementation — the codebase is a **single Laravel app** with no package/modules split beyond standard `app/` namespaces.
+
+---
+
+## 3. Directory structure
+
+Important paths under `backend` and their responsibilities:
+
+| Path                                   | Responsibility                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `routes/api.php`                       | All JSON API endpoints                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `routes/web.php`                       | `GET /` → `welcome` view only                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `routes/console.php`                   | Custom Artisan `inspire` command only                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `app/Http/Controllers/Controller.php`  | Base HTTP controller extending Laravel routing controller; provides trait/middleware support used by API controllers                                                                                                                                                                                                                                                                                                                                                       |
+| `app/Http/Controllers/Api/`            | API controllers (`Auth`, `AuthSession`, `AuthAuditLog`, `Profile`, `Dashboard`, `CameraAuth`, `User`, `Role`, `Camera`, `Vehicle`, `AnprEvent`, `AnprImage`, `AnprEventLog`, `Zone`, `Checkpoint`, `PatrolSession`, `PatrolRoute`, `CheckpointEvent`, `CheckpointEventMetric`, `LocationLog`, `PwaSync`, `PushSubscription`, `PushNotification`, `BlockchainRecord`) |
+| `app/Services/`                        | `Auth/*` (refresh tokens, 2FA, audit, camera auth, rate limiting), `Profile/*`, `PatrolMovementService`, `PatrolSessionSummaryService`, `PatrolValidationService`, `PatrolBroadcastService`, `PatrolPushNotificationService`, `Anpr/AnprImageFileService`, `Blockchain/*`, `Dashboard/DashboardSummaryService`, `WebPushNotificationService` |
+| `app/Http/Middleware/`                 | `EnsureUserIsAdmin`, `EnsureUserIsActive`, `EnsureUserCanAccessPatrolMonitoring`, `EnsureRequestIsAuthenticatedCamera`, `EnsureAnprWritePrincipal` |
+| `app/Http/Requests/`                   | `StoreUserRequest`, `UpdateUserRequest`, `StoreZoneRequest`, `UpdateZoneRequest`, `StoreCheckpointRequest`, `UpdateCheckpointRequest`, `StorePatrolSessionRequest`, `UpdatePatrolSessionRequest`, `StorePatrolRouteRequest`, `StoreCheckpointEventRequest`, `UpdateCheckpointEventRequest`, `StoreCheckpointEventMetricRequest`, `UpdateCheckpointEventMetricRequest`, `StoreLocationLogRequest`, `SyncPwaLocationLogRequest`, `StoreCameraRequest`, `UpdateCameraRequest` |
+| `app/Http/Resources/`                  | `UserResource`, `RoleResource`, `ZoneResource`, `CheckpointResource`, `PatrolSessionResource`, `PatrolRouteResource`, `CheckpointEventResource`, `CheckpointEventMetricResource`, `LocationLogResource`, `BlockchainRecordResource`, `AnprEventResource`, `AnprImageResource`, `AnprCameraResource`, `AnprVehicleResource`                                                                                                                                                 |
+| `app/Models/`                          | Eloquent models (`Camera`, `Vehicle`, `AnprEvent`, `AnprImage`, `AnprEventLog`, `Checkpoint`, `PatrolSession`, `PatrolRoute`, etc.)                                                                                                                                                                                                                                                                                                                                        |
+| `app/Providers/AppServiceProvider.php` | Empty `register` / `boot` (no bindings)                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `config/`                              | Framework and JWT config (`auth.php`, `jwt.php`, etc.)                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `database/migrations/`                 | Schema for `roles`, `users`, `blockchain_records`, `zones`, `checkpoints`, `patrol_sessions`, `patrol_routes`, `checkpoint_events`, `checkpoint_event_metrics`, `location_logs`, `cameras`, `vehicles`, `anpr_events`, `anpr_images`, `anpr_event_logs`                                                                                                                                                                                                                    |
+| `database/seeders/`                    | `RoleSeeder`, `UserSeeder`, `ZoneSeeder`, `CameraSeeder`, `VehicleSeeder`, `BlockchainRecordSeeder`, `CheckpointSeeder`, `PatrolSessionSeeder`, `CheckpointEventSeeder`, `AnprEventSeeder`, `DatabaseSeeder`                                                                                                                                                                                                                                                               |
+| `database/factories/`                  | `UserFactory`, `ZoneFactory`, `CameraFactory`, `VehicleFactory`, `CheckpointFactory`, `PatrolSessionFactory`, `CheckpointEventFactory`, `CheckpointEventMetricFactory`, `AnprEventFactory`, `AnprImageFactory`                                                                                                                                                                                                                                                             |
+
+### Not present in `app/` (verified)
+
+- **Policies** — no `app/Policies` directory; authorization uses middleware (`admin`, `active.user`, `patrol.monitoring`, `auth.camera`, `auth.anpr-write`), `RoleAccess`, and controller traits.
+- **Listeners** — no `app/Listeners` directory (patrol events broadcast directly via `ShouldBroadcastNow`).
+- **Traits / Helpers** — no `app/Traits` or `app/Helpers` namespaces (traits live on controllers under `app/Http/Controllers/Concerns/`).
+
+### Key file examples
+
+| File                                                           | Role                                                                                                                                                                                                                          |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `routes/api.php`                                               | Registers public `auth/login`, JWT-protected API groups, admin-only users/roles endpoints, and `auth/me` / `auth/logout` token lifecycle routes                                                                               |
+| `app/Http/Controllers/Controller.php`                          | Shared base controller (`Illuminate\Routing\Controller`) with standard Laravel traits; required so controller-level `$this->middleware(...)` works                                                                            |
+| `app/Http/Controllers/Api/ZoneController.php`                  | Zones CRUD + custom JSON envelope for list/detail                                                                                                                                                                             |
+| `app/Http/Controllers/Api/CheckpointController.php`            | Checkpoints CRUD + filters/search + custom JSON envelope                                                                                                                                                                      |
+| `app/Http/Controllers/Api/PatrolSessionController.php`         | Patrol sessions CRUD + filters/sort + custom JSON envelope                                                                                                                                                                    |
+| `app/Http/Controllers/Api/PatrolRouteController.php`           | `**GET /api/patrol-routes**` — compatibility list via `PatrolMovementService` (location_logs-first; legacy `patrol_routes` fallback); broadcasts N/A on read. `**POST /api/patrol-routes**` — **deprecated** append-only legacy store; broadcasts `**PatrolRouteUpdated**` |
+| `app/Services/PatrolBroadcastService.php`                      | Dispatches patrol monitoring websocket events when broadcasting enabled                                                                                                                                                       |
+| `app/Events/Patrol/*`                                          | Six `ShouldBroadcastNow` events for admin patrol monitoring                                                                                                                                                                   |
+| `app/Http/Controllers/Api/CheckpointEventController.php`       | Checkpoint events CRUD + filters/sort + custom JSON envelope (`CheckpointEventResource`; UUID route-model binding)                                                                                                            |
+| `app/Http/Controllers/Api/CheckpointEventMetricController.php` | Checkpoint event metrics CRUD + pagination + custom JSON envelope (`CheckpointEventMetricResource`; UUID route-model binding)                                                                                                 |
+| `app/Http/Controllers/Api/LocationLogController.php`           | Location logs index/store/show + filters/sort + custom JSON envelope (`LocationLogResource`; UUID route-model binding; **no** update or destroy)                                                                              |
+| `app/Http/Controllers/Api/PwaSyncController.php`               | `**POST /api/pwa/sync`** — idempotent `**location_log**` ingest from PWA queue (`SyncPwaLocationLogRequest`→`LocationLog`UUID PK = client`**locationLogId\*\*`)                                                               |
+| `app/Http/Controllers/Api/CameraController.php`                | Cameras CRUD + credential hashing + `CameraResource` + `Route::apiResource('cameras', ...)` under `auth:api` + `admin` |
+| `app/Http/Controllers/Api/CameraAuthController.php`            | **M1/M2:** `POST /api/camera-auth/login`; `POST`/`GET /api/camera-auth/heartbeat` (`auth.camera`, updates `last_seen_at`) |
+| `app/Http/Middleware/EnsureAnprWritePrincipal.php`           | **M2:** `auth.anpr-write` — camera JWT or active admin for ANPR write endpoints |
+| `app/Support/AnprCameraPrincipal.php`                          | **M2:** camera ownership checks and `last_seen_at` touch helper |
+| `app/Http/Controllers/Api/VehicleController.php`               | **M13:** Admin-only vehicles CRUD; `AnprVehicleResource`; paginated index; update prohibits `plate_number`/`source`                                                                                                           |
+| `app/Services/Anpr/AnprVehicleLinker.php`                      | **M13:** Normalize plate, link or auto-create vehicle on ANPR ingestion; normalized lookup removes common separators using database-safe SQL (`CHAR(92)` for backslash removal to avoid MySQL string-literal escaping issues) |
+| `app/Http/Controllers/Api/AnprEventController.php`             | ANPR events CRUD + **M10** index filters + `AnprEventResource` envelope (safe nested camera; no logs eager-load)                                                                                                              |
+| `app/Http/Controllers/Api/AnprImageController.php`             | ANPR images CRUD + `uploadForEvent()` multipart upload + `file()` evidence proxy + `AnprImageResource` (`url` / `image_url` when resolvable)                                                                                  |
+| `app/Models/BlockchainRecord.php`                              | Scopes, status helpers, `morphTo` entity                                                                                                                                                                                      |
+| `bootstrap/app.php`                                            | Routing + API JSON exception handlers                                                                                                                                                                                         |
+
+---
+
+## 4. API documentation
+
+**Base path:** all routes below are under `**/api`\*\* (e.g. `GET /api/users`).
+
+**Common headers (protected routes):** `Authorization: Bearer <access_token>` (JWT).
+
+### Response formats (actual behavior)
+
+Endpoints **do not** all share one envelope:
+
+| Pattern                                                                                   | Used by                                                                                                                                                                                                                                                             |
+| ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Laravel `JsonResource` default: top-level `data`, optional `links`, `meta` for pagination | `UserController`, `RoleController`, `BlockchainRecordController`                                                                                                                                                                                                    |
+| Custom `{ "success", "message", "data" }`                                                 | `AuthController@login`, `ZoneController` actions, `CheckpointController` actions, `PatrolSessionController` actions, `PatrolRouteController@store`, `CheckpointEventController` actions, `CheckpointEventMetricController` actions, `LocationLogController` actions |
+| Plain `{ "message" }`                                                                     | `UserController@destroy`                                                                                                                                                                                                                                            |
+| **204 No Content**                                                                        | `ZoneController@destroy`, `CheckpointController@destroy`, `PatrolSessionController@destroy`, `CheckpointEventController@destroy`, `CheckpointEventMetricController@destroy`                                                                                         |
+
+Validation errors (FormRequest / `ValidationException`): typically `**422`\*\* with `success: false`, `message: "Validation failed."`, `data.errors` — see `bootstrap/app.php` for JSON requests.
+
+### Public endpoints (no `auth:api` on route group)
+
+| Method | URI               | Controller@method      | Middleware       | Purpose   | Request validation                                         | Response                                                                                    |
+| ------ | ----------------- | ---------------------- | ---------------- | --------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| POST   | `/api/auth/login` | `AuthController@login` | `api` stack only | Credential validation + auth branching | Inline: `email` required email, `password` required string | Branches: `password_setup_required`, `two_factor_setup_required`, `otp_required`; **429** lockout after failed attempts (**M6**); JWT + cookie only after OTP/setup verify (**M5**) |
+| POST   | `/api/auth/refresh` | `AuthController@refresh` | `api` stack only | Rotate refresh session; issue new JWT | Refresh cookie required | Same JSON shape as login; rotates HttpOnly cookie; **401** if cookie missing/invalid, user is soft-deleted, `setup_required`, or `two_factor_enabled = false` (**M6/M5**) |
+| POST   | `/api/auth/logout` | `AuthController@logout` | `api` stack only | Revoke refresh session + clear cookie; invalidate JWT when bearer present | Refresh cookie optional; bearer optional | JSON: `success`, `message`, `data`; always clears refresh cookie (**200** even if JWT missing/expired) |
+| POST   | `/api/auth/password-setup/complete` | `AuthController@completePasswordSetup` | `api` stack only | Complete first-login password setup | `CompletePasswordSetupRequest`: `setup_token`, `password` (min from config), confirmed | JSON: `next_step = two_factor_setup_required`, `two_factor_setup_token`, `user`; **no** JWT or refresh cookie |
+| POST   | `/api/auth/2fa/setup/start` | `AuthController@startTwoFactorSetup` | `api` stack only | Begin TOTP setup | `StartTwoFactorSetupRequest`: `two_factor_setup_token` | JSON: `manual_key`, `otpauth_uri`, `expires_in`; **no** JWT or refresh cookie (**M5**) |
+| POST   | `/api/auth/2fa/setup/verify` | `AuthController@verifyTwoFactorSetup` | `api` stack only | Confirm TOTP setup | `VerifyTwoFactorSetupRequest`: `two_factor_setup_token`, `otp` | JWT + refresh cookie on success (**M5**) |
+| POST   | `/api/auth/otp/verify` | `AuthController@verifyOtp` | `api` stack only | Verify login OTP challenge | `VerifyOtpRequest`: `login_challenge_id`, `otp` | JWT + refresh cookie on success (**M5**) |
+| POST   | `/api/camera-auth/login` | `CameraAuthController@login` | `api` stack only | Machine camera login (**M1**); separate from user auth | `CameraLoginRequest`: `email`, `password`, optional `rtsp_url` | JWT bearer only (no refresh cookie, no OTP); updates `last_login_at` and optional RTSP report |
+| POST   | `/api/camera-auth/heartbeat` | `CameraAuthController@heartbeat` | `auth.camera` | Camera activity heartbeat (**M2**); updates `last_seen_at` | Bearer camera JWT | JSON: `camera_id`, `last_seen_at` |
+| GET    | `/api/camera-auth/heartbeat` | `CameraAuthController@heartbeat` | `auth.camera` | Same as POST heartbeat (M1 compatibility) | Bearer camera JWT | JSON: `camera_id`, `last_seen_at` |
+
+### Protected endpoints (`auth:api` middleware on route group)
+
+| Method    | URI                                                       | Controller@method                         | Additional middleware    | Purpose                                                                                                                                                                                                                         | Request validation                                                                                                                                                                                      | Response                                                                                                                                                                                                                                                                                                  |
+| --------- | --------------------------------------------------------- | ----------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET       | `/api/auth/me`                                            | `AuthController@me`                       | —                        | Return authenticated user profile and role                                                                                                                                                                                      | —                                                                                                                                                                                                       | JSON: `success`, `message`, `data.user`, `data.role`                                                                                                                                                                                                                                                      |
+| GET       | `/api/dashboard/summary`                                  | `DashboardController@summary`             | —                        | Role-aware operational dashboard summary (**M10**); all initialized roles                                                                                                                                                       | —                                                                                                                                                                                                       | JSON: `success`, `message`, `data` with `role`, `generated_at`, `timezone`, `summary`, `sections`; role-filtered; no secrets                                                                                                                                                                              |
+| GET       | `/api/profile`                                            | `ProfileController@show`                  | —                        | Self-service profile read (all initialized roles; **M2**)                                                                                                                                                                       | —                                                                                                                                                                                                       | JSON: `success`, `message`, `data.user` (`ProfileResource`; no secrets)                                                                                                                                                                                                                                    |
+| PATCH     | `/api/profile`                                            | `ProfileController@update`                | —                        | Self-service update of `phone`/`address` with optional `profile_version` concurrency (**M2**)                                                                                                                                   | `UpdateProfileRequest`                                                                                                                                                                                  | JSON: `success`, `message`, `data.user`; **409** `profile_version_conflict`; **422** validation                                                                                                                                                                                                           |
+| POST      | `/api/profile/picture`                                    | `ProfileController@uploadPicture`         | —                        | Self-service profile picture upload (**M3**)                                                                                                                                                                                    | `UploadProfilePictureRequest`: multipart `image`                                                                                                                                                        | JSON: `success`, `message`, `data.user` (`ProfileResource`); **422** validation                                                                                                                                                                                                                             |
+| DELETE    | `/api/profile/picture`                                    | `ProfileController@deletePicture`         | —                        | Self-service profile picture removal (**M3**); idempotent when no picture                                                                                                                                                       | —                                                                                                                                                                                                       | JSON: `success`, `message`, `data.user`; no version bump when already empty                                                                                                                                                                                                                                 |
+| POST      | `/api/profile/password/change`                            | `ProfileController@changePassword`        | —                        | Self-service password change with step-up verification (**M5**); revokes sessions and requires re-login                                                                                                                         | `ChangePasswordRequest`: `current_password`, `otp`, `password`, `password_confirmation`                                                                                                               | JSON: `success`, `message`, `data.requires_reauthentication`, `data.revoked_sessions_count`; **422** step-up/validation; **429** rate limit; clears refresh cookie                                                                                                                                         |
+| POST      | `/api/profile/email/start`                              | `ProfileController@startEmailChange`      | —                        | Start self-service email change; sends verification token to new email (**M6**)                                                                                                                                                 | `StartEmailChangeRequest`: `current_password`, `otp`, `new_email`                                                                                                                                       | JSON: `success`, `message`, `data.expires_in`, `data.masked_email`; **422** step-up/validation; **429** rate limit                                                                                                                                                                                          |
+| POST      | `/api/profile/email/confirm`                            | `ProfileController@confirmEmailChange`    | —                        | Confirm email change with token from email (**M6**); revokes sessions and requires re-login                                                                                                                                     | `ConfirmEmailChangeRequest`: `token`                                                                                                                                                                      | JSON: `success`, `message`, `data.requires_reauthentication`, `data.revoked_sessions_count`; **422** invalid token; clears refresh cookie                                                                                                                                                                  |
+| POST      | `/api/profile/2fa/reconfigure/start`                    | `ProfileController@startTwoFactorReconfigure` | —                    | Start self-service 2FA reconfiguration; returns new setup material (**M7**); old authenticator remains valid until verify                                                                                                     | `StartTwoFactorReconfigureRequest`: `current_password`, `otp`                                                                                                                                           | JSON: `success`, `message`, `data.two_factor_reconfigure_token`, `data.manual_key`, `data.otpauth_uri`, `data.expires_in`; **422** step-up; **429** rate limit                                                                                                                                              |
+| POST      | `/api/profile/2fa/reconfigure/verify`                 | `ProfileController@verifyTwoFactorReconfigure` | —                   | Verify new authenticator OTP and apply reconfigured secret (**M7**); revokes sessions and requires re-login                                                                                                                     | `VerifyTwoFactorReconfigureRequest`: `two_factor_reconfigure_token`, `otp`                                                                                                                              | JSON: `success`, `message`, `data.requires_reauthentication`, `data.revoked_sessions_count`; **422** invalid token/OTP; **429** OTP rate limit; clears refresh cookie                                                                                                                                       |
+| GET       | `/api/auth/sessions`                                      | `AuthSessionController@index`             | —                        | List refresh sessions (own; Admin all/filter; **`scope=mine`** for own-only, **M9**)                                                                                                                                              | Optional: `user_id`, `scope=mine`, `per_page`                                                                                                                                                           | Paginated session metadata; no `token_hash` (**M7**)                                                                                                                                                                                                                                                        |
+| DELETE    | `/api/auth/sessions/{session}`                            | `AuthSessionController@destroy`           | —                        | Revoke refresh session                                                                                                                                                                                                          | —                                                                                                                                                                                                       | JSON success; audit `session_revoked`; clears cookie if current session (**M7**)                                                                                                                                                                                                                          |
+| POST      | `/api/auth/logout-all`                                    | `AuthSessionController@logoutAll`         | —                        | Revoke all refresh sessions for caller                                                                                                                                                                                          | —                                                                                                                                                                                                       | Clears refresh cookie; audit `logout_all_success` (**M7**)                                                                                                                                                                                                                                                  |
+| POST      | `/api/auth/2fa/reset/{user}`                              | `AuthController@resetTwoFactor`           | `admin`                  | Admin resets target user 2FA, revokes target refresh sessions, clears pending challenges (**M9**)                                                                                                                               | —                                                                                                                                                                                                       | JSON: `success`, `data.user` (`UserResource`); no secrets/tokens                                                                                                                                                                                                                                          |
+| GET       | `/api/auth/audit-logs`                                    | `AuthAuditLogController@index`            | `admin`                  | Paginated auth audit log list with filters (**M7**)                                                                                                                                                                             | Query: `user_id`, `event_type`, `status`, `date_from`, `date_to`, `per_page`                                                                                                                            | Paginated audit rows; no token/hash secrets                                                                                                                                                                                                                                                               |
+| GET       | `/api/blockchain-records/summary`                         | `BlockchainRecordController@summary`      | Admin                    | Dashboard status counts, network/environment breakdown, latest failed records                                                                                     | —                                                                                                                                                                                                       | JSON: `success`, `message`, `data` (no RPC/private key fields)                                                                                                                                                                                                                                            |
+| GET       | `/api/blockchain-records`                                 | `BlockchainRecordController@index`        | Admin                    | Paginated/filtered blockchain records                                                                                                                                                                                           | Inline query: `status`, `network`, `environment`, `entity_type`, `entity_id` (UUID), `search`, `sort_by`, `sort_order`, `per_page`                                                                      | `JsonResource` collection + pagination meta                                                                                                                                                                                                                                                               |
+| GET       | `/api/blockchain-records/{blockchain_record}`             | `BlockchainRecordController@show`         | Admin                    | Single record with eager-loaded `jobs`, `verifications`, `verifications.verifiedBy`                                                                                                                                             | Implicit binding                                                                                                                                                                                        | `BlockchainRecordResource`                                                                                                                                                                                                                                                                                |
+| POST      | `/api/blockchain-records/{blockchain_record}/verify`      | `BlockchainRecordController@verify`       | Admin                    | Run hash/on-chain verification; persists `blockchain_verifications` + verify job                                                                                                                                                | None                                                                                                                                                                                                    | `BlockchainVerificationResource` (**201**)                                                                                                                                                                                                                                                                |
+| POST      | `/api/blockchain-records/verify-all`                      | `BlockchainRecordController@verifyAll`      | Admin                    | Bulk verify eligible records                                                                                                                                                                                                    | Optional filters in body/query                                                                                                                                                                          | JSON summary of verification results                                                                                                                                                                                                                                                                      |
+| POST      | `/api/blockchain-records/{blockchain_record}/refresh`     | `BlockchainRecordController@refresh`        | Admin                    | Re-poll submitted tx receipt for confirmation (**M9**)                                                                                                                                                                          | None                                                                                                                                                                                                    | `BlockchainRecordResource` or **422** when not refreshable                                                                                                                                                                                                                                                |
+| POST      | `/api/blockchain-records/{blockchain_record}/retry`       | `BlockchainRecordController@retry`        | Admin                    | Re-queue a **failed** record for anchoring; returns record with `jobs`                                                                                                                                                          | None                                                                                                                                                                                                    | `BlockchainRecordResource` (**200**) or **422** when status is not `failed`                                                                                                                                                                                                                               |
+| GET       | `/api/roles`                                              | `RoleController@index`                    | `admin`                  | Paginated roles (admin-only)                                                                                                                                                                                                    | —                                                                                                                                                                                                       | `RoleResource` collection                                                                                                                                                                                                                                                                                 |
+| GET       | `/api/roles/{role}`                                       | `RoleController@show`                     | `admin`                  | Single role (admin-only)                                                                                                                                                                                                        | Implicit binding                                                                                                                                                                                        | `RoleResource`                                                                                                                                                                                                                                                                                            |
+| GET       | `/api/users`                                              | `UserController@index`                    | `admin`                  | Paginated users (+ trashed flags, admin-only)                                                                                                                                                                                   | Query: `only_trashed`, `include_trashed` booleans (read via `request()->boolean`)                                                                                                                       | `UserResource` collection                                                                                                                                                                                                                                                                                 |
+| POST      | `/api/users`                                              | `UserController@store`                    | `admin`                  | Create user (admin-only); defaults `setup_required = true`                                                                                                                                                                      | `StoreUserRequest`                                                                                                                                                                                      | JSON: `data` (UserResource), one-time `password_setup.token` + `expires_at` (**201**)                                                                                                                                                                                                                     |
+| GET       | `/api/users/{user}`                                       | `UserController@show`                     | `admin`                  | Show user (admin-only)                                                                                                                                                                                                          | —                                                                                                                                                                                                       | `UserResource`                                                                                                                                                                                                                                                                                            |
+| PUT/PATCH | `/api/users/{user}`                                       | `UserController@update`                   | `admin`                  | Update user (admin-only). Non-empty password sets `last_password_changed_at`, revokes all target refresh sessions, and writes `password_changed` audit (**M9**). Clients cannot write 2FA or timestamp fields directly.          | `UpdateUserRequest`                                                                                                                                                                                     | `UserResource`                                                                                                                                                                                                                                                                                            |
+| DELETE    | `/api/users/{user}`                                       | `UserController@destroy`                  | `admin`                  | Soft delete user (admin-only)                                                                                                                                                                                                   | —                                                                                                                                                                                                       | `{ "message": "User deleted successfully." }`                                                                                                                                                                                                                                                             |
+| POST      | `/api/users/{user}/restore`                               | `UserController@restore`                  | `admin`                  | Restore soft-deleted user (admin-only)                                                                                                                                                                                          | —                                                                                                                                                                                                       | `UserResource`                                                                                                                                                                                                                                                                                            |
+| GET       | `/api/zones`                                              | `ZoneController@index`                    | —                        | List/search/sort zones                                                                                                                                                                                                          | Inline query: `search`, `sort`, `per_page`, `page`                                                                                                                                                      | `{ success, message, data }` with paginated resource payload inside `data` (each zone includes `checkpoints_count`)                                                                                                                                                                                       |
+| POST      | `/api/zones`                                              | `ZoneController@store`                    | `EnsureUserIsAdmin`      | Create zone                                                                                                                                                                                                                     | `StoreZoneRequest`                                                                                                                                                                                      | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| GET       | `/api/zones/{zone}`                                       | `ZoneController@show`                     | —                        | Show zone                                                                                                                                                                                                                       | —                                                                                                                                                                                                       | `{ success, message, data }` (zone includes `checkpoints_count`)                                                                                                                                                                                                                                          |
+| PUT/PATCH | `/api/zones/{zone}`                                       | `ZoneController@update`                   | `EnsureUserIsAdmin`      | Update zone                                                                                                                                                                                                                     | `UpdateZoneRequest`                                                                                                                                                                                     | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| DELETE    | `/api/zones/{zone}`                                       | `ZoneController@destroy`                  | `EnsureUserIsAdmin`      | Delete zone                                                                                                                                                                                                                     | —                                                                                                                                                                                                       | **204** empty body                                                                                                                                                                                                                                                                                        |
+| GET       | `/api/cameras`                                            | `CameraController@index`                  | `admin`                  | List cameras (**M1:** `CameraResource`; no password/hash)                                                                                                                                                                     | —                                                                                                                                                                                                       | Custom `{ success, message, data }` JSON                                                                                                                                                                                                                                                                  |
+| POST      | `/api/cameras`                                            | `CameraController@store`                  | `admin`                  | Create camera with machine credentials (**M1:** requires `email` + `password`; hashes password; `rtsp_url` prohibited)                                                                                                          | `StoreCameraRequest`                                                                                                                                                                                    | `{ success, message, data }` — `CameraResource`                                                                                                                                                                                                                                                           |
+| GET       | `/api/cameras/{camera}`                                   | `CameraController@show`                   | `admin`                  | Show camera                                                                                                                                                                                                                     | —                                                                                                                                                                                                       | `{ success, message, data }` — `CameraResource`                                                                                                                                                                                                                                                           |
+| PUT/PATCH | `/api/cameras/{camera}`                                   | `CameraController@update`                 | `admin`                  | Update camera (**M1:** optional password rotates hash; empty password ignored; `rtsp_url` prohibited)                                                                                                                           | `UpdateCameraRequest`                                                                                                                                                                                   | `{ success, message, data }` — `CameraResource`                                                                                                                                                                                                                                                           |
+| DELETE    | `/api/cameras/{camera}`                                   | `CameraController@destroy`                | `admin`                  | Hard delete camera                                                                                                                                                                                                              | —                                                                                                                                                                                                       | **204** empty body                                                                                                                                                                                                                                                                                        |
+| GET       | `/api/checkpoints`                                        | `CheckpointController@index`              | —                        | List checkpoints with pagination/filter/search                                                                                                                                                                                  | Inline query: `zone_id`, `is_active`, `location_type`, `search`, `per_page`                                                                                                                             | `{ success, message, data }` with paginated resource payload inside `data`                                                                                                                                                                                                                                |
+| POST      | `/api/checkpoints`                                        | `CheckpointController@store`              | —                        | Create checkpoint                                                                                                                                                                                                               | `StoreCheckpointRequest`                                                                                                                                                                                | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| GET       | `/api/checkpoints/{checkpoint}`                           | `CheckpointController@show`               | —                        | Show checkpoint                                                                                                                                                                                                                 | —                                                                                                                                                                                                       | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| PUT/PATCH | `/api/checkpoints/{checkpoint}`                           | `CheckpointController@update`             | —                        | Update checkpoint                                                                                                                                                                                                               | `UpdateCheckpointRequest`                                                                                                                                                                               | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| DELETE    | `/api/checkpoints/{checkpoint}`                           | `CheckpointController@destroy`            | —                        | Hard delete checkpoint                                                                                                                                                                                                          | —                                                                                                                                                                                                       | **204** empty body                                                                                                                                                                                                                                                                                        |
+| GET       | `/api/patrol-sessions/active`                             | `PatrolSessionController@active`          | —                        | Restore authenticated guard's in-progress patrol session (**M9**)                                                                                                                                                             | —                                                                                                                                                                                                       | `{ success, message, data }` with session + checkpoint events; **404** when none active                                                                                                                                                                                                                    |
+| GET       | `/api/patrol-sessions`                                    | `PatrolSessionController@index`           | `patrol.monitoring`      | List patrol sessions with pagination/filter/sort (**Admin + Security Operator**)                                                                                                                                                | Inline query: `user_id`, `zone_id`, `status`, `sort`, `per_page`                                                                                                                                        | `{ success, message, data }` with paginated resource payload inside `data`                                                                                                                                                                                                                                |
+| POST      | `/api/patrol-sessions`                                    | `PatrolSessionController@store`           | —                        | Create patrol session                                                                                                                                                                                                           | `StorePatrolSessionRequest`                                                                                                                                                                             | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| GET       | `/api/patrol-sessions/{patrol_session}`                   | `PatrolSessionController@show`            | `patrol.monitoring`      | Show patrol session (**Admin + Security Operator**)                                                                                                                                                                             | —                                                                                                                                                                                                       | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| GET       | `/api/patrol-sessions/{patrol_session}/summary`           | `PatrolSessionController@summary`         | —                        | Gap-aware patrol summary (computed from `location_logs` + `checkpoint_events`; not stored)                                                                                                                                      | Implicit UUID binding                                                                                                                                                                                   | `{ success, message, data }` — see [Patrol session summary](#patrol-session-summary-milestone-12)                                                                                                                                                                                                         |
+| POST      | `/api/patrol-sessions/{patrol_session}/validate`          | `PatrolSessionController@validateSession` | —                        | Run backend validation engine; upsert `checkpoint_events` + metrics per zone checkpoint                                                                                                                                         | Implicit UUID binding                                                                                                                                                                                   | `{ success, message, data }` — see [Patrol validation engine](#patrol-validation-engine-milestone-1)                                                                                                                                                                                                      |
+| PUT/PATCH | `/api/patrol-sessions/{patrol_session}`                   | `PatrolSessionController@update`          | —                        | Update patrol session                                                                                                                                                                                                           | `UpdatePatrolSessionRequest`                                                                                                                                                                            | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| DELETE    | `/api/patrol-sessions/{patrol_session}`                   | `PatrolSessionController@destroy`         | —                        | Hard delete patrol session                                                                                                                                                                                                      | —                                                                                                                                                                                                       | **204** empty body                                                                                                                                                                                                                                                                                        |
+| GET       | `/api/patrol-routes`                                      | `PatrolRouteController@index`             | `patrol.monitoring`      | List drawable patrol movement (**Admin + Security Operator**). Reads canonical **`location_logs`** via `PatrolMovementService`; falls back to legacy **`patrol_routes`** only when the session has no usable logs; **never merges both**. | Inline query: `patrol_session_id` (optional UUID), `per_page` (1–1000, default **500**), `page`; ordered by `**recorded_at` asc\*\*                                                                     | `{ success, message, data }` with paginated `PatrolRouteResource` payload inside `data`                                                                                                                                                                                                                   |
+| POST      | `/api/patrol-routes`                                      | `PatrolRouteController@store`             | —                        | **Deprecated.** Legacy append-only GPS breadcrumb for old clients (`Deprecation` header). Prefer `POST /location-logs` or `POST /pwa/sync`. SPA must not dual-write.                                                                                                                  | `StorePatrolRouteRequest` (`patrol_session_id` required; legacy `**patrol_log_id`** accepted when session id omitted); optional `**timestamp**`(epoch ms) or`**recorded_at\*\*`                         | `{ success, message, data }` (`PatrolRouteResource`; **201**); broadcasts `**PatrolRouteUpdated`\*\* when `BROADCAST_CONNECTION` is not `null`/`log` (legacy path)                                                                                                                                                      |
+| POST      | `/api/broadcasting/auth`                                  | Closure (`Broadcast::auth`)               | `auth:api`               | Authorize private websocket channels for SPA (JWT Bearer)                                                                                                                                                                       | `channel_name`, `socket_id` (Pusher protocol)                                                                                                                                                           | Pusher-compatible auth payload                                                                                                                                                                                                                                                                            |
+| GET       | `/api/checkpoint-events`                                  | `CheckpointEventController@index`         | `patrol.monitoring`      | List checkpoint events with pagination/filter/sort (**Admin + Security Operator**)                                                                                                                                              | Inline query: `patrol_session_id`, `checkpoint_id`, `status`, `detection_type`, `sort` (`latest` or `oldest` on `detected_at`), `per_page`                                                              | `{ success, message, data }` with paginated resource payload inside `data`                                                                                                                                                                                                                                |
+| POST      | `/api/checkpoint-events`                                  | `CheckpointEventController@store`         | —                        | Create checkpoint event                                                                                                                                                                                                         | `StoreCheckpointEventRequest`                                                                                                                                                                           | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| GET       | `/api/checkpoint-events/{checkpoint_event}`               | `CheckpointEventController@show`          | —                        | Show checkpoint event                                                                                                                                                                                                           | Implicit UUID binding                                                                                                                                                                                   | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| PUT/PATCH | `/api/checkpoint-events/{checkpoint_event}`               | `CheckpointEventController@update`        | —                        | Update checkpoint event                                                                                                                                                                                                         | `UpdateCheckpointEventRequest`                                                                                                                                                                          | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| DELETE    | `/api/checkpoint-events/{checkpoint_event}`               | `CheckpointEventController@destroy`       | —                        | Permanent delete (no soft deletes)                                                                                                                                                                                              | —                                                                                                                                                                                                       | **204** empty body                                                                                                                                                                                                                                                                                        |
+| GET       | `/api/checkpoint-event-metrics`                           | `CheckpointEventMetricController@index`   | —                        | List checkpoint event metrics with pagination                                                                                                                                                                                   | Inline query: `per_page`                                                                                                                                                                                | `{ success, message, data }` with paginated resource payload inside `data`                                                                                                                                                                                                                                |
+| POST      | `/api/checkpoint-event-metrics`                           | `CheckpointEventMetricController@store`   | —                        | Create checkpoint event metric                                                                                                                                                                                                  | `StoreCheckpointEventMetricRequest`                                                                                                                                                                     | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| GET       | `/api/checkpoint-event-metrics/{checkpoint_event_metric}` | `CheckpointEventMetricController@show`    | —                        | Show checkpoint event metric                                                                                                                                                                                                    | Implicit UUID binding                                                                                                                                                                                   | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| PUT/PATCH | `/api/checkpoint-event-metrics/{checkpoint_event_metric}` | `CheckpointEventMetricController@update`  | —                        | Update checkpoint event metric                                                                                                                                                                                                  | `UpdateCheckpointEventMetricRequest`                                                                                                                                                                    | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| DELETE    | `/api/checkpoint-event-metrics/{checkpoint_event_metric}` | `CheckpointEventMetricController@destroy` | —                        | Permanent delete checkpoint event metric                                                                                                                                                                                        | —                                                                                                                                                                                                       | **204** empty body                                                                                                                                                                                                                                                                                        |
+| GET       | `/api/location-logs`                                      | `LocationLogController@index`             | —                        | Paginated location logs; filter `patrol_session_id`, `user_id`; sort by device `timestamp` ascending                                                                                                                            | Inline query: `patrol_session_id`, `user_id`, `per_page`                                                                                                                                                | `{ success, message, data }` with paginated `LocationLogResource` payload inside `data`                                                                                                                                                                                                                   |
+| POST      | `/api/location-logs`                                      | `LocationLogController@store`             | —                        | Ingest single log; optional client `id` (UUID); server sets `server_received_at`                                                                                                                                                | `StoreLocationLogRequest`                                                                                                                                                                               | `{ success, message, data }` (**201**)                                                                                                                                                                                                                                                                    |
+| POST      | `/api/pwa/sync`                                           | `PwaSyncController@sync`                  | —                        | Idempotent ingest from PWA `**sync_queue`** (`type: location_log`); client `**locationLogId**`maps to`location_logs.id`; `**patrolId**`maps to`patrol_session_id`; `**source**`must be`**live**`, `**resume**`, or `**sync\*\*` | `SyncPwaLocationLogRequest`                                                                                                                                                                             | `{ success, message, data }` with `**LocationLog**` fields + `**duplicate**` boolean (**200** + `**duplicate: true`** on matching replay, **201** + `**duplicate: false`** on first insert, **409** if same id with mismatched payload, **422\*\* on validation failure)                                  |
+| POST      | `/api/push-subscriptions`                                 | `PushSubscriptionController@store`        | —                        | Register/update Web Push subscription (`endpoint`, `keys.p256dh`, `keys.auth`, optional `user_agent`); upserts by unique `endpoint`; sets `user_id` from JWT                                                                    | `StorePushSubscriptionRequest`                                                                                                                                                                          | `{ success, message, data }` with subscription `id` (**201**)                                                                                                                                                                                                                                             |
+| DELETE    | `/api/push-subscriptions/{push_subscription}`             | `PushSubscriptionController@destroy`      | —                        | Remove subscription by UUID; **403** if row belongs to another user                                                                                                                                                             | —                                                                                                                                                                                                       | **204** empty body                                                                                                                                                                                                                                                                                        |
+| POST      | `/api/push-notifications/test`                            | `PushNotificationController@test`         | —                        | Send a test Web Push to the **authenticated user’s** stored subscriptions (development / PWA verification)                                                                                                                      | Optional: `title`, `body`                                                                                                                                                                               | `{ success, message, data }` — `data` includes delivery stats (`attempted`, `succeeded`, `failed`, `expired`, …). **503** if VAPID not configured; **422** if no subscriptions or invalid payload; **502** if all delivery attempts failed; **200** only when at least one subscription receives the push |
+| GET       | `/api/location-logs/{location_log}`                       | `LocationLogController@show`              | —                        | Show location log                                                                                                                                                                                                               | Implicit UUID binding                                                                                                                                                                                   | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| GET       | `/api/vehicles`                                           | `VehicleController@index`                 | `admin`                  | List vehicles (paginated, plate search)                                                                                                                                                                                         | `search`, `page`, `per_page`                                                                                                                                                                            | `{ success, message, data }` — paginated `AnprVehicleResource` collection                                                                                                                                                                                                                                 |
+| POST      | `/api/vehicles`                                           | `VehicleController@store`                 | `admin`                  | Create vehicle (manual)                                                                                                                                                                                                         | Normalizes `plate_number`; rejects normalized duplicates; `source` prohibited (set to `manual` server-side)                                                                                             | `{ success, message, data }` — `AnprVehicleResource` (**201**)                                                                                                                                                                                                                                            |
+| GET       | `/api/vehicles/{vehicle}`                                 | `VehicleController@show`                  | `admin`                  | Show vehicle                                                                                                                                                                                                                    | Implicit UUID binding                                                                                                                                                                                   | `{ success, message, data }` — `AnprVehicleResource`                                                                                                                                                                                                                                                      |
+| PUT/PATCH | `/api/vehicles/{vehicle}`                                 | `VehicleController@update`                | `admin`                  | Update vehicle metadata                                                                                                                                                                                                         | `owner_name`, `vehicle_type`, `status`, `notes` only; `plate_number`/`source` prohibited                                                                                                                | `{ success, message, data }` — `AnprVehicleResource`                                                                                                                                                                                                                                                      |
+| DELETE    | `/api/vehicles/{vehicle}`                                 | `VehicleController@destroy`               | `admin`                  | Permanent delete vehicle row                                                                                                                                                                                                    | —                                                                                                                                                                                                       | **204** empty body                                                                                                                                                                                                                                                                                        |
+| GET       | `/api/anpr-events`                                        | `AnprEventController@index`               | `patrol.monitoring`      | List ANPR events with pagination and filters (**Admin + Security Operator**)                                                                                                                                                    | Inline query: `per_page`, `page`, `plate_number`, `search`, `is_valid`, `is_flagged`, `date_from`, `date_to`, `camera_id`, `sort`, `direction`, `since` (M12 live polling)                              | `{ success, message, data }` — paginated `AnprEventResource` collection inside `data`; default sort `detection_time` desc; `since` filters `created_at > since` OR `detection_time > since`                                                                                                               |
+| POST      | `/api/anpr-events`                                        | `AnprEventController@store`               | `auth.anpr-write`        | Create ANPR event (**M2:** camera JWT derives `camera_id`; admin still sends `camera_id`)                                                                                                                                       | Inline validation (`camera_id` required for admin only; `plate_number`, `confidence`, `detection_time`, …; `blockchain_record_id` **prohibited**) | `{ success, message, data }` — `AnprEventResource` (**201**); camera writes update `last_seen_at` |
+| GET       | `/api/anpr-events/{anpr_event}`                           | `AnprEventController@show`                | `patrol.monitoring`      | Show ANPR event (**Admin + Security Operator**)                                                                                                                                                                                 | Implicit UUID binding                                                                                                                                                                                   | `{ success, message, data }` — `AnprEventResource` with safe nested `camera`, `vehicle`, `images`                                                                                                                                                                                                         |
+| PUT/PATCH | `/api/anpr-events/{anpr_event}`                           | `AnprEventController@update`              | `admin`                  | Update ANPR event (**Admin only**)                                                                                                                                                                                              | Inline validation (same fields as create; `sometimes` for patch semantics)                                                                                                                              | `{ success, message, data }` — `AnprEventResource`                                                                                                                                                                                                                                                        |
+| DELETE    | `/api/anpr-events/{anpr_event}`                           | `AnprEventController@destroy`             | `admin`                  | Permanent delete ANPR event row (**Admin only**)                                                                                                                                                                                | —                                                                                                                                                                                                       | **204** empty body; **409** when event has `entity_created` proof or any child image has `evidence_file` proof                                                                                                                                                                                            |
+| POST      | `/api/anpr-events/{anpr_event}/images/upload`             | `AnprImageController@uploadForEvent`      | `auth.anpr-write`        | Upload evidence image (**M2:** camera limited to own events)                                                                                                                                                                    | Inline validation (`image_type`, `image` file)                                                                                                                                                          | `{ success, message, data }` — `AnprImageResource`; **403** if camera does not own event |
+| GET       | `/api/anpr-images`                                        | `AnprImageController@index`               | `patrol.monitoring`      | List ANPR images with pagination (**Admin + Security Operator**)                                                                                                                                                                | Inline query: `per_page`, `anpr_event_id`, `image_type`                                                                                                                                                 | `{ success, message, data }` — paginated `AnprImageResource` collection inside `data`                                                                                                                                                                                                                     |
+| POST      | `/api/anpr-images`                                        | `AnprImageController@store`               | `auth.anpr-write`        | Create ANPR image metadata (path and attributes only); camera limited to own events                                                                                                                                               | Inline validation (`anpr_event_id`, `image_type`, `file_path`, `file_size`, `resolution`, `expires_at`)                                                                                                 | `{ success, message, data }` — `AnprImageResource` (**201**)                                                                                                                                                                                                                                              |
+| GET       | `/api/anpr-images/{anpr_image}`                           | `AnprImageController@show`                | `patrol.monitoring`      | Show ANPR image metadata (**Admin + Security Operator**)                                                                                                                                                                        | Implicit UUID binding                                                                                                                                                                                   | `{ success, message, data }` — `AnprImageResource` (includes `url` / `image_url` when file is resolvable)                                                                                                                                                                                                 |
+| GET       | `/api/anpr-images/{anpr_image}/file`                      | `AnprImageController@file`                | `patrol.monitoring`      | Serve evidence image binary when `file_path` resolves under `ANPR_IMAGE_ROOTS` (**Admin + Security Operator**)                                                                                                                | JWT required; path traversal rejected; **404** when unavailable                                                                                                                                         | Binary file response (`Content-Type` from `mime_content_type`) or JSON **404** envelope                                                                                                                                                                                                                   |
+| PUT/PATCH | `/api/anpr-images/{anpr_image}`                           | `AnprImageController@update`              | `admin`                  | Update ANPR image metadata (**Admin only**)                                                                                                                                                                                     | Inline validation (same fields as create; `sometimes` for patch semantics)                                                                                                                              | `{ success, message, data }` — `AnprImageResource`; **409** when changing canonical proof fields on a proofed image (`anpr_event_id`, `image_type`, `file_path`, `file_size`, `resolution`)                                                                                                               |
+| DELETE    | `/api/anpr-images/{anpr_image}`                           | `AnprImageController@destroy`             | `admin`                  | Permanent delete ANPR image row (**Admin only**)                                                                                                                                                                                | —                                                                                                                                                                                                       | **204** empty body; **409** when an `evidence_file` blockchain proof exists                                                                                                                                                                                                                               |
+| GET       | `/api/anpr-event-logs`                                    | `AnprEventLogController@index`            | `patrol.monitoring`      | List ANPR event logs with pagination (**Admin + Security Operator**)                                                                                                                                                            | Inline query: `per_page`                                                                                                                                                                                | `{ success, message, data }` with paginated payload inside `data`                                                                                                                                                                                                                                         |
+| POST      | `/api/anpr-event-logs`                                    | `AnprEventLogController@store`            | `auth.anpr-write`        | Create ANPR event log; camera limited to own events                                                                                                                                                                               | Inline validation (`anpr_event_id`, `stage`, `message`)                                                                                                                                                 | `{ success, message, data }` (**201**)                                                                                                                                                                                                                                                                    |
+| GET       | `/api/anpr-event-logs/{anpr_event_log}`                   | `AnprEventLogController@show`             | `patrol.monitoring`      | Show ANPR event log (**Admin + Security Operator**)                                                                                                                                                                             | Implicit UUID binding                                                                                                                                                                                   | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| PUT/PATCH | `/api/anpr-event-logs/{anpr_event_log}`                   | `AnprEventLogController@update`           | `admin`                  | Update ANPR event log (**Admin only**)                                                                                                                                                                                          | Inline validation (same fields as create; `sometimes` for patch semantics)                                                                                                                              | `{ success, message, data }`                                                                                                                                                                                                                                                                              |
+| DELETE    | `/api/anpr-event-logs/{anpr_event_log}`                   | `AnprEventLogController@destroy`          | `admin`                  | Permanent delete ANPR event log row (**Admin only**)                                                                                                                                                                            | —                                                                                                                                                                                                       | **204** empty body                                                                                                                                                                                                                                                                                        |
+
+**Login request body example:**
+
+```json
+{
+    "email": "admin@example.com",
+    "password": "password"
+}
+```
+
+**JWT success payload shape** (`AuthController`): `data.access_token`, `data.token_type` (`"bearer"`), `data.expires_in` (seconds; implementation uses `auth('api')->getTTL() * 60`), `data.user`, and `data.role`.
+
+`**data.user` for SPA auth:** `UserResource` includes nested `**role`** (`{ id, name }`via`RoleResource`). The React app persists this object as `localStorage.auth_user`and reads`**role.name**`for Milestone 6 route/menu guards (canonical names:`Admin`, `Security Operator`, `Guard`).
+
+**User Management CRUD (frontend `feature/management-user`):** Create/update payloads must use `StoreUserRequest` / `UpdateUserRequest` field names: `name`, `email`, `password` (required on create; optional on update), `role_id` (UUID from `GET /api/roles`), and optional `phone` / `address`. The SPA does not send legacy `full_name`, `username`, `phone_number`, or string `role` slugs. Validation errors return Laravel's standard `{ message, errors: { field: [...] } }` shape on **422**.
+
+---
+
+## 5. Database documentation
+
+### Tables (from migrations)
+
+All **37** migration files under `database/migrations/` define the schema below (including additive alters; `2026_07_01_110000_sanitize_legacy_camera_passwords.php` is data-only). Primary keys are **UUID** on domain tables except Laravel queue `jobs` (bigint). **37** domain/infrastructure tables total; **25** are application domain (excluding `jobs`).
+
+| Table | Primary key | Notes |
+| ----- | ----------- | ----- |
+| `roles` | `id` UUID | `name` unique |
+| `users` | `id` UUID | FK `role_id` → `roles` (nullable, null on delete); `setup_required` default `false`; `two_factor_enabled`, `two_factor_secret` (text), `two_factor_confirmed_at`; `profile_version` default `1`; `last_password_changed_at`, `last_security_changed_at`; nullable `profile_picture_url`; **soft deletes** (`deleted_at`) |
+| `refresh_tokens` | `id` UUID | **M1:** FK `user_id` → `users` (cascade); indexed `token_hash`, `token_family`; `device_name`, `ip_address`, `user_agent`; `expires_at`, `revoked_at`, `rotated_at`, `last_used_at` |
+| `password_setup_tokens` | `id` UUID | **M4:** FK `user_id` → `users` (cascade); indexed `token_hash` (SHA-256); `expires_at`; nullable `used_at` |
+| `two_factor_setup_sessions` | `id` UUID | **M5:** FK `user_id` → `users` (cascade); indexed `token_hash`; nullable `pending_secret`; `expires_at`, `verified_at`; `failed_attempts` default `0`, nullable `locked_at` |
+| `auth_login_challenges` | `id` UUID | **M5:** FK `user_id` → `users` (cascade); `expires_at`; nullable `consumed_at`; `failed_attempts` default `0`; nullable `locked_at`, `ip_address`, `user_agent` |
+| `auth_audit_logs` | `id` UUID | **M6/M7:** nullable FK `user_id` → `users` (null on delete); indexed `event_type`, `status`, `occurred_at`; nullable `email`, `ip_address`, `user_agent`, `metadata` JSON |
+| `profile_change_tokens` | `id` UUID | **Profile M1:** FK `user_id` → `users` (cascade); indexed `type`; unique `token_hash`; nullable `pending_payload`; `expires_at`; nullable `used_at`; nullable `ip_address`, `user_agent` |
+| `push_subscriptions` | `id` UUID | FK `user_id` → `users` (nullable, null on delete); unique `endpoint` string(768); `keys` JSON; nullable `user_agent`, `last_used_at` |
+| `zones` | `id` UUID | `name` unique; FK `created_by` → `users` (nullable, null on delete) |
+| `checkpoints` | `id` UUID | FK `zone_id` → `zones` (cascade); unique `(zone_id, name)`; `location_type` enum (`outdoor`,`indoor`); `radius` default `20` |
+| `patrol_sessions` | `id` UUID | FK `user_id` → `users` (cascade), FK `zone_id` → `zones` (restrict), nullable FK `blockchain_record_id` → `blockchain_records` (null on delete); `status` enum (`active`,`completed`,`aborted`); composite index `(user_id, zone_id, started_at)` |
+| `patrol_routes` | `id` UUID | FK `patrol_session_id` → `patrol_sessions` (cascade); append-only breadcrumbs; `created_at` only |
+| `location_logs` | `id` UUID | FK `patrol_session_id` → `patrol_sessions` (cascade), FK `user_id` → `users` (cascade); device `timestamp` unsigned bigint (ms); `source` enum (`live`,`resume`,`sync`); `tracking_state` enum (`active`,`resumed`,`offline`); `created_at` only; **no** FK to checkpoints |
+| `checkpoint_events` | `id` UUID | FK `patrol_session_id` → `patrol_sessions` (cascade), FK `checkpoint_id` → `checkpoints` (cascade); `detection_type` enum (`continuous`,`resume`,`manual`, nullable); `status` enum (`pending`,`verified`,`partial`,`needs_review`,`suspicious`,`missed`); legacy API `uncertain`/`rejected` normalized before persist |
+| `checkpoint_event_metrics` | `id` UUID | FK `checkpoint_event_id` → `checkpoint_events` (cascade), **unique** `checkpoint_event_id` (1:1); scoring decimals; `created_at` only |
+| `cameras` | `id` UUID | ANPR/RTSP source; nullable unique `email`; nullable `rtsp_url`; `credential_enabled` default `false`; `credential_rotated_at`, `last_login_at`, `rtsp_reported_at`; indexed `is_active`, `ip_address`, `last_seen_at` |
+| `vehicles` | `id` UUID | `plate_number` unique; `status` enum (`normal`,`flagged`,`whitelist`); `source` enum (`manual`,`auto_detected`) |
+| `anpr_events` | `id` UUID | FK `camera_id` → `cameras` (restrict), nullable FK `vehicle_id` → `vehicles` (null on delete), nullable FK `blockchain_record_id` → `blockchain_records` (null on delete); `plate_number`, `confidence`, `detection_time`, `is_flagged`, `is_valid` |
+| `anpr_images` | `id` UUID | FK `anpr_event_id` → `anpr_events` (cascade); `image_type` enum (`full`,`plate`,`annotated`); `file_path`; nullable `expires_at` |
+| `anpr_event_logs` | `id` UUID | FK `anpr_event_id` → `anpr_events` (cascade); `stage` string(50); nullable `message` |
+| `blockchain_records` | `id` UUID | Proof metadata: `entity_type`, `entity_id`, `proof_type`, `canonical_version`, `record_hash` (char 64); `network` (`ganache`,`sepolia`), `environment` (`local`,`staging`,`production`); `status` (`pending`…`failed`); unique `(entity_type, entity_id, proof_type, canonical_version, environment, record_hash)` |
+| `blockchain_jobs` | `id` UUID | FK `blockchain_record_id` → `blockchain_records` (cascade); `job_type` (`anchor`,`retry_anchor`,`verify`,`refresh_confirmation`); `status` (`queued`…`cancelled`); nullable `context_tx_hash` (indexed) |
+| `blockchain_verifications` | `id` UUID | FK `blockchain_record_id` → `blockchain_records` (cascade); nullable FK `verified_by` → `users`; hash comparison fields; `result` enum; `created_at` only |
+| `jobs` | `id` bigint | Laravel queue table (infrastructure; unsigned integer epoch timestamps) |
+
+### Model relationships
+
+`**User**`
+
+- `role()`: **belongsTo** `Role` (`role_id`).
+- `refreshTokens()`: **hasMany** `RefreshToken`.
+- `passwordSetupTokens()`: **hasMany** `PasswordSetupToken`.
+- `twoFactorSetupSessions()`: **hasMany** `TwoFactorSetupSession`.
+- `authLoginChallenges()`: **hasMany** `AuthLoginChallenge`.
+- `profileChangeTokens()`: **hasMany** `ProfileChangeToken`.
+- `pushSubscriptions()`: **hasMany** `PushSubscription`.
+- `blockchainVerifications()`: **hasMany** `BlockchainVerification` via `verified_by`.
+- **FK only (no Eloquent relation on `User`):** `auth_audit_logs.user_id`, `patrol_sessions.user_id`, `location_logs.user_id`, `zones.created_by`.
+
+`**RefreshToken**` / `**PasswordSetupToken**` / `**TwoFactorSetupSession**` / `**AuthLoginChallenge**` / `**ProfileChangeToken**`
+
+- Each **belongsTo** `User` via `user_id`.
+
+`**AuthAuditLog**`
+
+- `user()`: **belongsTo** `User` (nullable FK).
+
+`**Role**`
+
+- No `users()` relationship defined on the model (only `User::role()` exists).
+
+`**Zone**`
+
+- `creator()`: **belongsTo** `User` via `created_by`.
+- `checkpoints()`: **hasMany** `Checkpoint`.
+
+`**PatrolSession`\*\*
+
+- `user()`: **belongsTo** `User`.
+- `zone()`: **belongsTo** `Zone`.
+- `blockchainRecord()`: **belongsTo** `BlockchainRecord`.
+- `locationLogs()`: **hasMany** `LocationLog`.
+- `patrolRoutes()`: **hasMany** `PatrolRoute`.
+- `checkpointEvents()`: **hasMany** `CheckpointEvent`.
+
+`**PatrolRoute`\*\*
+
+- `patrolSession()`: **belongsTo** `PatrolSession`.
+
+`**Checkpoint`\*\*
+
+- `zone()`: **belongsTo** `Zone`.
+- `checkpointEvents()`: **hasMany** `CheckpointEvent`.
+
+`**CheckpointEvent`\*\*
+
+- `patrolSession()`: **belongsTo** `PatrolSession`.
+- `checkpoint()`: **belongsTo** `Checkpoint`.
+- `metric()`: **hasOne** `CheckpointEventMetric`.
+
+`**CheckpointEventMetric`\*\*
+
+- `checkpointEvent()`: **belongsTo** `CheckpointEvent`.
+
+`**LocationLog`\*\*
+
+- `user()`: **belongsTo** `User`.
+- `patrolSession()`: **belongsTo** `PatrolSession`.
+
+`**Camera`\*\*
+
+- `anprEvents()`: **hasMany** `AnprEvent`.
+
+`**Vehicle`\*\*
+
+- `anprEvents()`: **hasMany** `AnprEvent`.
+
+`**AnprEvent`\*\*
+
+- `vehicle()`: **belongsTo** `Vehicle` (nullable FK).
+- `camera()`: **belongsTo** `Camera`.
+- `blockchainRecord()`: **belongsTo** `BlockchainRecord` (nullable FK).
+- `images()`: **hasMany** `AnprImage` (table/module optional; relation is nullable-safe in controller eager loading).
+- `logs()`: **hasMany** `AnprEventLog` (table/module optional; relation is nullable-safe in controller eager loading).
+
+`**AnprImage`\*\*
+
+- `anprEvent()`: **belongsTo** `AnprEvent`.
+
+`**AnprEventLog`\*\*
+
+- `anprEvent()`: **belongsTo** `AnprEvent`.
+
+`**BlockchainRecord`\*\*
+
+- `entity()`: **morphTo** (`entity_type`, `entity_id`) — semantic module key only; requires future morph map before reliable resolution (see model docblock).
+- `jobs()`: **hasMany** `BlockchainJob`.
+- `verifications()`: **hasMany** `BlockchainVerification`.
+
+`**BlockchainJob`\*\*
+
+- `blockchainRecord()`: **belongsTo** `BlockchainRecord`.
+
+`**BlockchainVerification`\*\*
+
+- `blockchainRecord()`: **belongsTo** `BlockchainRecord`.
+- `verifiedBy()`: **belongsTo** `User` via `verified_by`.
+
+### Pivot tables
+
+Unable to determine from current implementation — **no** `belongsToMany` migrations or pivot tables exist in `database/migrations`.
+
+### ERD-style overview
+
+Derived from all **37** files in `database/migrations/` (final schema as of July 2026). The Laravel queue table `jobs` is listed in the tables inventory but omitted from diagrams below — it is infrastructure, not domain data.
+
+#### Domain clusters
+
+| Cluster | Tables | Purpose |
+| ------- | ------ | ------- |
+| **Identity & access** | `roles`, `users`, `refresh_tokens`, `password_setup_tokens`, `two_factor_setup_sessions`, `auth_login_challenges`, `auth_audit_logs`, `profile_change_tokens`, `push_subscriptions` | JWT login, refresh rotation, first-login setup, TOTP 2FA, audit/monitoring, profile step-up tokens, Web Push |
+| **Patrol operations** | `zones`, `checkpoints`, `patrol_sessions`, `patrol_routes`, `location_logs`, `checkpoint_events`, `checkpoint_event_metrics` | Facility geography, live patrol evidence, validation scoring |
+| **ANPR** | `cameras`, `vehicles`, `anpr_events`, `anpr_images`, `anpr_event_logs` | Plate detection, watchlist, evidence files, AI audit stages |
+| **Blockchain** | `blockchain_records`, `blockchain_jobs`, `blockchain_verifications` | Canonical hashing, anchoring jobs, manual/scheduled verification |
+
+#### High-level relationship map
+
+```mermaid
+flowchart TB
+  subgraph identity["Identity & access"]
+    roles --> users
+    users --> refresh_tokens
+    users --> password_setup_tokens
+    users --> two_factor_setup_sessions
+    users --> auth_login_challenges
+    users --> auth_audit_logs
+    users --> profile_change_tokens
+    users --> push_subscriptions
+  end
+
+  subgraph patrol["Patrol operations"]
+    users --> patrol_sessions
+    zones --> patrol_sessions
+    zones --> checkpoints
+    patrol_sessions --> patrol_routes
+    patrol_sessions --> location_logs
+    patrol_sessions --> checkpoint_events
+    checkpoints --> checkpoint_events
+    checkpoint_events --> checkpoint_event_metrics
+    users --> location_logs
+    users --> zones
+  end
+
+  subgraph anpr["ANPR"]
+    cameras --> anpr_events
+    vehicles --> anpr_events
+    anpr_events --> anpr_images
+    anpr_events --> anpr_event_logs
+  end
+
+  subgraph chain["Blockchain"]
+    blockchain_records --> blockchain_jobs
+    blockchain_records --> blockchain_verifications
+    users --> blockchain_verifications
+    blockchain_records -.-> patrol_sessions
+    blockchain_records -.-> anpr_events
+  end
+```
+
+Solid arrows are foreign keys. Dotted lines are optional nullable FKs (`blockchain_record_id` on `patrol_sessions` and `anpr_events`). There is **no** FK between `location_logs` and `checkpoint_events` — validation links them logically via `PatrolValidationService`.
+
+#### Identity & access (detail)
+
+```mermaid
+erDiagram
+  roles ||--o{ users : "role_id SET NULL"
+  users ||--o{ refresh_tokens : "user_id CASCADE"
+  users ||--o{ password_setup_tokens : "user_id CASCADE"
+  users ||--o{ two_factor_setup_sessions : "user_id CASCADE"
+  users ||--o{ auth_login_challenges : "user_id CASCADE"
+  users ||--o{ auth_audit_logs : "user_id SET NULL"
+  users ||--o{ profile_change_tokens : "user_id CASCADE"
+  users ||--o{ push_subscriptions : "user_id SET NULL"
+
+  roles {
+    uuid id PK
+    string name UK
+    text description
+  }
+  users {
+    uuid id PK
+    uuid role_id FK
+    string name
+    string email UK
+    string password
+    boolean setup_required
+    boolean two_factor_enabled
+    text two_factor_secret
+    timestamp two_factor_confirmed_at
+    int profile_version
+    timestamp last_password_changed_at
+    timestamp last_security_changed_at
+    timestamp deleted_at
+  }
+  refresh_tokens {
+    uuid id PK
+    uuid user_id FK
+    string token_hash
+    uuid token_family
+    timestamp expires_at
+    timestamp revoked_at
+  }
+  password_setup_tokens {
+    uuid id PK
+    uuid user_id FK
+    string token_hash
+    timestamp expires_at
+    timestamp used_at
+  }
+  two_factor_setup_sessions {
+    uuid id PK
+    uuid user_id FK
+    string token_hash
+    text pending_secret
+    timestamp expires_at
+    int failed_attempts
+    timestamp locked_at
+  }
+  auth_login_challenges {
+    uuid id PK
+    uuid user_id FK
+    timestamp expires_at
+    timestamp consumed_at
+    int failed_attempts
+    timestamp locked_at
+  }
+  auth_audit_logs {
+    uuid id PK
+    uuid user_id FK
+    string event_type
+    string status
+    json metadata
+    timestamp occurred_at
+  }
+  profile_change_tokens {
+    uuid id PK
+    uuid user_id FK
+    string type
+    string token_hash UK
+    text pending_payload
+    timestamp expires_at
+    timestamp used_at
+  }
+  push_subscriptions {
+    uuid id PK
+    uuid user_id FK
+    string endpoint UK
+    json keys
+  }
+```
+
+#### Patrol operations (detail)
+
+```mermaid
+erDiagram
+  users ||--o{ zones : "created_by SET NULL"
+  users ||--o{ patrol_sessions : "user_id CASCADE"
+  users ||--o{ location_logs : "user_id CASCADE"
+  zones ||--o{ checkpoints : "zone_id CASCADE"
+  zones ||--o{ patrol_sessions : "zone_id RESTRICT"
+  patrol_sessions ||--o{ patrol_routes : "patrol_session_id CASCADE"
+  patrol_sessions ||--o{ location_logs : "patrol_session_id CASCADE"
+  patrol_sessions ||--o{ checkpoint_events : "patrol_session_id CASCADE"
+  checkpoints ||--o{ checkpoint_events : "checkpoint_id CASCADE"
+  checkpoint_events ||--o| checkpoint_event_metrics : "checkpoint_event_id UK"
+
+  zones {
+    uuid id PK
+    string name UK
+    uuid created_by FK
+  }
+  checkpoints {
+    uuid id PK
+    uuid zone_id FK
+    string name
+    decimal latitude
+    decimal longitude
+    float radius
+    enum location_type
+    boolean is_active
+  }
+  patrol_sessions {
+    uuid id PK
+    uuid user_id FK
+    uuid zone_id FK
+    uuid blockchain_record_id FK
+    timestamp started_at
+    timestamp ended_at
+    enum status
+  }
+  patrol_routes {
+    uuid id PK
+    uuid patrol_session_id FK
+    decimal latitude
+    decimal longitude
+    timestamp recorded_at
+  }
+  location_logs {
+    uuid id PK
+    uuid patrol_session_id FK
+    uuid user_id FK
+    decimal latitude
+    decimal longitude
+    bigint timestamp
+    enum source
+    enum tracking_state
+  }
+  checkpoint_events {
+    uuid id PK
+    uuid patrol_session_id FK
+    uuid checkpoint_id FK
+    enum detection_type
+    float confidence_score
+    enum status
+  }
+  checkpoint_event_metrics {
+    uuid id PK
+    uuid checkpoint_event_id FK
+    decimal distance_score
+    decimal accuracy_score
+    decimal time_score
+    decimal stability_score
+  }
+```
+
+#### ANPR & blockchain (detail)
+
+```mermaid
+erDiagram
+  cameras ||--o{ anpr_events : "camera_id RESTRICT"
+  vehicles ||--o{ anpr_events : "vehicle_id SET NULL"
+  anpr_events ||--o{ anpr_images : "anpr_event_id CASCADE"
+  anpr_events ||--o{ anpr_event_logs : "anpr_event_id CASCADE"
+  blockchain_records ||--o{ anpr_events : "blockchain_record_id SET NULL"
+  blockchain_records ||--o{ patrol_sessions : "blockchain_record_id SET NULL"
+  blockchain_records ||--o{ blockchain_jobs : "blockchain_record_id CASCADE"
+  blockchain_records ||--o{ blockchain_verifications : "blockchain_record_id CASCADE"
+  users ||--o{ blockchain_verifications : "verified_by SET NULL"
+
+  cameras {
+    uuid id PK
+    string name
+    string email UK
+    text rtsp_url
+    boolean credential_enabled
+    boolean is_active
+    timestamp last_seen_at
+  }
+  vehicles {
+    uuid id PK
+    string plate_number UK
+    enum status
+    enum source
+  }
+  anpr_events {
+    uuid id PK
+    uuid camera_id FK
+    uuid vehicle_id FK
+    uuid blockchain_record_id FK
+    string plate_number
+    decimal confidence
+    timestamp detection_time
+    boolean is_flagged
+    boolean is_valid
+  }
+  anpr_images {
+    uuid id PK
+    uuid anpr_event_id FK
+    enum image_type
+    string file_path
+    timestamp expires_at
+  }
+  anpr_event_logs {
+    uuid id PK
+    uuid anpr_event_id FK
+    string stage
+    text message
+  }
+  blockchain_records {
+    uuid id PK
+    string entity_type
+    string entity_id
+    string proof_type
+    char record_hash
+    enum network
+    enum environment
+    enum status
+    string tx_hash
+    bigint block_number
+  }
+  blockchain_jobs {
+    uuid id PK
+    uuid blockchain_record_id FK
+    enum job_type
+    enum status
+    string context_tx_hash
+    int attempts
+  }
+  blockchain_verifications {
+    uuid id PK
+    uuid blockchain_record_id FK
+    uuid verified_by FK
+    enum result
+    char stored_hash
+    char recomputed_hash
+    timestamp verified_at
+  }
+```
+
+#### Schema notes
+
+1. **Append-only tables** (`created_at` only, no `updated_at`): `location_logs`, `patrol_routes`, `checkpoint_event_metrics`, `blockchain_verifications`.
+2. **`checkpoint_events.status`** enum is replaced in migration `2026_07_04_100000_update_checkpoint_events_status_for_m8.php` (MySQL raw `ALTER`); other drivers may store string values without DB-level enum enforcement.
+3. **`blockchain_records`** unique key includes `record_hash` after `2026_06_29_120000_update_blockchain_records_unique_constraint_for_profile_proofs.php` (supports multiple profile proofs per user).
+4. **`jobs`** (Laravel queue) uses bigint PK and unsigned integer epoch columns — not shown in ERD diagrams.
+5. **No pivot tables** — all relationships are one-to-many via foreign keys; no `belongsToMany` in migrations.
+
+### Zone schema and API status
+
+The `zones` table and REST API align with migration `2026_05_07_010225_create_zones_table.php`.
+
+**Database columns (`zones`):**
+
+| Column        | Type              | Constraints              |
+| ------------- | ----------------- | ------------------------ |
+| `id`          | UUID              | Primary key              |
+| `name`        | string(255)       | Unique                   |
+| `description` | text              | Nullable                 |
+| `created_by`  | UUID FK → `users` | Nullable; `nullOnDelete` |
+| `created_at`  | timestamp         |                          |
+| `updated_at`  | timestamp         |                          |
+
+**Relationships:** `creator` (belongsTo `User` via `created_by`); `checkpoints` (hasMany `Checkpoint`).
+
+**Endpoints** (all under `auth:api`; `store` / `update` / `destroy` also require `EnsureUserIsAdmin`):
+
+| Method   | Path                | Notes                                                              |
+| -------- | ------------------- | ------------------------------------------------------------------ |
+| `GET`    | `/api/zones`        | Query: `search`, `sort` (`latest` \| `oldest`), `per_page`, `page` |
+| `POST`   | `/api/zones`        | Body validated by `StoreZoneRequest`                               |
+| `GET`    | `/api/zones/{zone}` | Route-model binding on UUID                                        |
+| `PATCH`  | `/api/zones/{zone}` | Body validated by `UpdateZoneRequest`                              |
+| `DELETE` | `/api/zones/{zone}` | **204** empty body                                                 |
+
+**Create / update request body:**
+
+```json
+{
+    "name": "Main Entrance",
+    "description": "Primary public access point.",
+    "created_by": "optional-user-uuid"
+}
+```
+
+- `name`: required, string, max 255, unique on `zones.name` (ignored on update for current row).
+- `description`: optional, string, max 1000.
+- `created_by`: optional, must exist in `users.id` when provided.
+
+**Single-zone response (`ZoneResource` inside `{ success, message, data }`):**
+
+```json
+{
+    "success": true,
+    "message": "Zone retrieved successfully.",
+    "data": {
+        "id": "550e8400-e29b-41d4-a716-446655440000",
+        "name": "Main Entrance",
+        "description": "Primary public access point.",
+        "checkpoints_count": 3,
+        "created_at": "2026-05-07T10:00:00.000000Z",
+        "updated_at": "2026-05-07T10:00:00.000000Z",
+        "creator": {
+            "id": "user-uuid",
+            "name": "Admin User"
+        }
+    }
+}
+```
+
+`creator` is `null` when `created_by` is null. List (`GET /api/zones`) returns the same zone shape inside Laravel pagination: `data.data[]`, `data.meta`, `data.links`.
+
+**Validation error (422):**
+
+```json
+{
+    "success": false,
+    "message": "Validation failed.",
+    "data": {
+        "errors": {
+            "name": ["The name has already been taken."]
+        }
+    }
+}
+```
+
+**Implementation files:** `Zone` model, `ZoneController`, `StoreZoneRequest`, `UpdateZoneRequest`, `ZoneResource`, `ZoneFactory`, `ZoneSeeder`.
+
+### Checkpoint schema and API status
+
+The `checkpoints` module is fully implemented and wired:
+
+- Migration: `2026_05_07_094600_create_checkpoints_table.php`
+- Model: `App\Models\Checkpoint`
+- API: `CheckpointController` + requests/resources + `Route::apiResource('checkpoints', ...)` under `auth:api`
+- Seeding: `CheckpointFactory`, `CheckpointSeeder`, and `DatabaseSeeder` call chain
+
+**`location_type` column:** DB enum `outdoor` \| `indoor` (default `outdoor`). Create/update validation in `StoreCheckpointRequest` / `UpdateCheckpointRequest`: `Rule::in(['outdoor', 'indoor'])`. Index filter query param `location_type` accepts the same two values.
+
+**Coordinates:** `latitude` and `longitude` are `decimal(10, 7)` in migration `2026_05_07_094600_create_checkpoints_table.php`. Validation: required on create; `numeric`, latitude `between:-90,90`, longitude `between:-180,180`. `radius`: required, `numeric`, `min:5`, `max:100` (metres).
+
+**Create request body (example):**
+
+```json
+{
+    "zone_id": "zone-uuid",
+    "name": "North Gate",
+    "description": null,
+    "latitude": 3.139,
+    "longitude": 101.6869,
+    "radius": 20,
+    "location_type": "outdoor",
+    "is_active": true
+}
+```
+
+**Checkpoint resource fields (typical):** `id`, `zone_id`, `name`, `description`, `latitude`, `longitude`, `radius`, `location_type`, `is_active`, `created_at`, `updated_at`, nested `zone` on show/index when eager-loaded.
+
+**Implementation files:** `Checkpoint` model, `CheckpointController`, `StoreCheckpointRequest`, `UpdateCheckpointRequest`, `CheckpointResource`, `CheckpointFactory`, `CheckpointSeeder`.
+
+### Patrol session schema and API status
+
+The `patrol_sessions` module is fully implemented and wired:
+
+- Migration: `2026_05_07_120000_create_patrol_sessions_table.php`
+- Model: `App\Models\PatrolSession`
+- API: `PatrolSessionController` + requests/resources + `Route::apiResource('patrol-sessions', ...)` under `auth:api`
+- Summary: `**GET /api/patrol-sessions/{patrol_session}/summary**` via `PatrolSessionController@summary` + `App\Services\PatrolSessionSummaryService` (registered **before** the `apiResource` so `{patrol_session}` does not capture `summary`)
+- Validation: `**POST /api/patrol-sessions/{patrol_session}/validate`** via `PatrolSessionController@validateSession` + `App\Services\PatrolValidationService` (registered **before** the `apiResource`; controller method is `**validateSession`** because `validate`conflicts with`Controller::validate()`)
+- Seeding: `PatrolSessionFactory`, `PatrolSessionSeeder`, and `DatabaseSeeder` call chain
+
+**Date/time handling (`started_at` / `ended_at`):**
+
+- Application timezone: **`UTC`** (`config/app.php`).
+- MySQL/MariaDB connections set session timezone **`+00:00`** via `DB_TIMEZONE` (`config/database.php`) so `timestamp` columns round-trip without local-offset drift.
+- `StorePatrolSessionRequest` normalizes inbound `started_at` / `ended_at` to UTC ISO-8601 before validation and persistence.
+- `PatrolSessionResource` and `PatrolSessionSummaryService` serialize datetimes through `App\Support\ApiDateTime` (ISO-8601 UTC strings, e.g. `2026-06-12T00:30:00+00:00`) so SPA clients never receive ambiguous `Y-m-d H:i:s` values that JavaScript would parse as local time.
+
+**Create request body (example):**
+
+```json
+{
+    "user_id": "user-uuid",
+    "zone_id": "zone-uuid",
+    "started_at": "2026-06-12T00:30:00.000Z",
+    "status": "active"
+}
+```
+
+For an active patrol, omit `ended_at` (or send `null`). The guard SPA sends `started_at` as `new Date().toISOString()`; the API response `data.started_at` is the canonical stored instant.
+
+#### Patrol validation engine (Milestone 1)
+
+**Route:** `POST /api/patrol-sessions/{patrol_session}/validate` (JWT `auth:api`).
+
+**Service:** `App\Services\PatrolValidationService::validatePatrolSession(PatrolSession $patrolSession)`.
+
+**Source of truth:** The backend reconstructs patrol movement from append-only `**location_logs`** (ordered by device `**timestamp**`in milliseconds — never`created_at`) and validates each zone checkpoint. Frontend geofence PATCH values (`confidence_score` 80/65, etc.) are **provisional\*\* only; authoritative `checkpoint_events.status`, `confidence_score`, and `detection_type` are set by this endpoint.
+
+**Frontend integration (Milestone 2):** The React guard patrol module calls this endpoint from `usePatrolController.completePatrol` after `flushSyncQueue()` when the browser is online, then fetches `GET …/summary`. Skipped when offline.
+
+**Admin monitoring (Milestone 3–4):** `feature/patrol-monitoring` exposes **Re-run Validation** on `/admin/patrol-monitoring/:patrolSessionId`, then reloads `GET …/summary`, `GET /checkpoint-events?patrol_session_id=…`, and `**GET /patrol-routes?patrol_session_id=…`\*\* for the route map.
+
+**Gap-aware segment reconstruction:**
+
+1. Load `location_logs` for the session sorted by `timestamp` ascending.
+2. Detect **gaps** when consecutive logs differ by **> 30 seconds** (`gap_seconds` = delta ÷ 1000). Each gap records `previous_log_id`, `next_log_id`, `gap_seconds`.
+3. Split logs into **continuous segments** (groups with no inter-log gap > 30s). Segment metadata: `start_timestamp`, `end_timestamp`, `log_count`, `duration_seconds`.
+4. **Do not** link `location_logs` to checkpoints; logs stay raw.
+
+**Checkpoint detection:**
+
+- **Effective radius** = `checkpoint.radius + (accuracy × 0.5)`; null accuracy → **50 m**.
+- **Continuous:** logs inside effective radius within the **same segment**, dwell ≥ **3 seconds** (first-to-last timestamp inside radius).
+- **Resume:** log with `source = resume` or `tracking_state = resumed` inside radius when continuous stay cannot be proved; capped below continuous confidence (max **79** before status rules).
+
+**Anti-cheat (M8 tuned):** Configurable thresholds in `config/patrol_validation.php`. Points with accuracy > **150 m** are ignored for movement math; poor accuracy (**75–150 m**) is discounted. Speed > **41.67 m/s** or GPS jump **> 100 m** within **≤ 5 s** require **2+** bad transitions before strong suspicion (except **severe** jump ≥ **300 m** with good accuracy). Route corridor tolerance uses checkpoint line segments + buffer (`route_corridor` config). Duplicate/out-of-order timestamps remain integrity signals.
+
+**Confidence scoring (per checkpoint):** weighted base — distance **0.30**, accuracy **0.25**, time **0.25**, stability **0.20** — then `confidence = base × gap_factor × integrity_factor`. Integrity: clean **1.0**, moderate **0.9**, strong **0.5**. **M8 statuses:** `verified`, `partial`, `needs_review`, `suspicious`, `missed` (+ `pending`). Legacy `uncertain` → `needs_review`, `rejected` → `missed`. See `docs/system-update/m8-patrol-validation-tuning.md`.
+
+**Persistence:** For each checkpoint in the session zone, create or update `checkpoint_events` (`patrol_session_id` + `checkpoint_id`) and upsert `checkpoint_event_metrics` with score breakdown. Existing events are **not** deleted.
+
+**Blockchain proof (M12):** When `BLOCKCHAIN_ENABLED=true`, after validation completes successfully, `BlockchainPatrolIntegrationService` creates a `blockchain_records` row (`entity_type = patrol_session`, `proof_type = validation_result`) and queues `AnchorBlockchainRecordJob`. The validation response is **not** delayed for on-chain confirmation. Failures to create a proof are logged and do not roll back validation. See [`blockchain/docs/m12-patrol-and-profile-future-integration.md`](../blockchain/docs/m12-patrol-and-profile-future-integration.md).
+
+**Response `data`:** `patrol_session_id`, `total_location_logs`, `total_segments`, `total_gaps`, `anomalies`, `checkpoint_results[]` (each with `checkpoint_id`, `checkpoint_name`, `detection_type`, `confidence_score`, `status`, component scores, `gap_factor`, `integrity_factor`).
+
+`**anomalies` object (non-destructive; legacy keys preserved):\*\*
+
+| Key                 | Description                                                                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `timestamp_issues`  | `{ duplicate_ids[], invalid_ids[], out_of_order_ids[] }` — log IDs with timestamp integrity problems                                             |
+| `segment_anomalies` | Map keyed by `segment_index` → `{ major, minor, speed_anomaly, gps_jump, low_accuracy, timestamp_issue }` (used by checkpoint integrity scoring) |
+| `gaps`              | `{ previous_log_id, next_log_id, gap_seconds }[]` — gaps **> 30 s** between consecutive logs                                                     |
+| `items`             | **Milestone 10** — flat list for map visualization (see below)                                                                                   |
+
+`**anomalies.items[]` fields (each suspicious movement segment or point):\*\*
+
+| Field                                | Type   | Description                                                           |
+| ------------------------------------ | ------ | --------------------------------------------------------------------- | ------------------------------ | --------------- | ----------------- |
+| `id`                                 | string | Stable id for UI selection (e.g. `speed-{start_log_id}-{end_log_id}`) |
+| `type`                               | string | `speed_anomaly`                                                       | `gps_jump`                     | `poor_accuracy` | `timestamp_issue` |
+| `severity`                           | string | `minor`                                                               | `major`                        |
+| `message`                            | string | Human-readable explanation                                            |
+| `start_log_id`                       | UUID   | First `location_log` in the segment                                   |
+| `end_log_id`                         | UUID   | Last `location_log` in the segment                                    |
+| `start_timestamp`                    | int    | null                                                                  | Device timestamp (ms) at start |
+| `end_timestamp`                      | int    | null                                                                  | Device timestamp (ms) at end   |
+| `start_latitude` / `start_longitude` | float  | Start coordinates                                                     |
+| `end_latitude` / `end_longitude`     | float  | End coordinates                                                       |
+| `distance_meters`                    | float? | Haversine distance (edge anomalies)                                   |
+| `speed_mps`                          | float? | Effective speed used for detection                                    |
+| `calculated_speed_mps`               | float? | Distance ÷ Δt                                                         |
+| `reported_speed_mps`                 | float? | Device-reported speed when present                                    |
+
+`PatrolValidationCompleted` broadcasts the full validation `data` object (including `anomalies.items`) to `private-patrol.monitoring` and `private-patrol.session.{id}`.
+
+#### Patrol session summary (Milestone 12)
+
+**Route:** `GET /api/patrol-sessions/{patrol_session}/summary` (JWT `auth:api`).
+
+**Response `data` fields:** `patrol_session_id`, `status`, `started_at`, `ended_at`, `total_location_logs`, `total_checkpoints`, `verified_checkpoints`, `uncertain_checkpoints`, `suspicious_checkpoints`, `rejected_checkpoints`, `pending_checkpoints`, `completion_percentage` (verified ÷ total × 100), `total_gaps`, `longest_gap_seconds`, `total_gap_seconds`, `confidence_level` (`high` `medium` `low`), `confidence_score` (0–100).
+
+**Gap detection:** `location_logs` for the session ordered by device `timestamp` (ms). A gap exists when the delta between consecutive logs is **> 30 seconds**; gap duration is that delta in seconds. Medium gap: **> 30s and ≤ 300s** (−10 confidence each). Large gap: **> 300s** (−20 each).
+
+**Confidence scoring (starts at 100, clamped 0–100):** −10 per medium gap, −20 per large gap, −10 if any checkpoint `pending`, −15 if any `rejected`, −10 if any `suspicious`. Level: **≥ 80** `high`, **≥ 50** `medium`, else `low`.
+
+**Not persisted** — no summary table; full anomaly engine / blockchain not in scope.
+
+### Checkpoint events schema and API status
+
+The `checkpoint_events` module is fully implemented and wired:
+
+- Migration: `2026_05_07_141500_create_checkpoint_events_table.php`
+- Model: `App\Models\CheckpointEvent` (UUID primary key assigned on create via `Str::uuid()`; no soft deletes)
+- API: `CheckpointEventController` + form requests + `CheckpointEventResource` + `Route::apiResource('checkpoint-events', ...)` under `auth:api`
+- Seeding: `CheckpointEventFactory`, `CheckpointEventSeeder` (skipped if patrol sessions or checkpoints are missing), registered after `CheckpointSeeder` in `DatabaseSeeder`
+
+**API resource shape:** validation context fields (`entered_at`, `exited_at`, `detected_at`, `processed_at`, `detection_type`, `confidence_score`, `status`) plus nested `checkpoint` (when loaded: `id`, `name`, `latitude`, `longitude`, `radius`), nested `patrol_session` (when loaded: `id`, `user_id`, `zone_id`, `status`, `started_at`, `ended_at`), and nested `metric` (when loaded: `CheckpointEventMetricResource`, including computed `calculated_confidence_score`).
+
+**PATCH semantics (`UpdateCheckpointEventRequest`):** clients may update `status`, `detected_at`, `detection_type` (`continuous` `resume` `manual`), and `confidence_score` (0–100), plus optional `entered_at` / `exited_at` / `processed_at`. The PWA patrol flow sends provisional values during patrol; call `**POST /api/patrol-sessions/{id}/validate`\*\* after sync for authoritative backend scoring (see [Patrol validation engine](#patrol-validation-engine-milestone-1)).
+
+### Checkpoint event metrics schema and API status
+
+The `checkpoint_event_metrics` module is implemented and wired:
+
+- Migration: `2026_05_07_150000_create_checkpoint_event_metrics_table.php`
+- Model: `App\Models\CheckpointEventMetric` (UUID primary key assigned on create via `Str::uuid()`; `UPDATED_AT` disabled; no soft deletes)
+- API: `CheckpointEventMetricController` + form requests + `CheckpointEventMetricResource` + `Route::apiResource('checkpoint-event-metrics', ...)` under `auth:api`
+- Factory: `CheckpointEventMetricFactory` (not registered in `DatabaseSeeder` by default)
+
+**API resource shape:** stored scoring fields, computed `calculated_confidence_score` (not persisted), `created_at`, and nested `checkpoint_event` when that relationship is eager loaded.
+
+### Location logs schema and API status
+
+The `location_logs` module is implemented and wired:
+
+- Migration: `2026_05_07_161000_create_location_logs_table.php`
+- Model: `App\Models\LocationLog` (UUID primary key; client may supply `id` or the server generates one; `UPDATED_AT` disabled; **no** `HasFactory` / factory)
+- API: `LocationLogController` + `StoreLocationLogRequest` + `LocationLogResource` + `Route::apiResource('location-logs', ...)->only(['index','store','show'])` under `auth:api`
+- **No** seeder or factory
+
+**Immutability (Milestone 13):** `location_logs` are raw patrol evidence. Rows are append-only: `**POST /api/location-logs`**, `**POST /api/pwa/sync**`, and direct model inserts (tests/seeds) only. There is **no\*\* HTTP `PUT`/`PATCH`/`DELETE` on this resource (`405 Method Not Allowed` on unsupported verbs). `PatrolValidationService` reads logs but does not mutate them. Patrol validation and gap analysis depend on this audit trail; blockchain anchoring is out of scope for this milestone.
+
+**API resource shape:** stored log fields (`latitude`, `longitude`, `accuracy`, device `timestamp`, `server_received_at`, `source`, `tracking_state`, `speed`, `heading`, `created_at`), optional nested `user` when loaded (`id`, `name`), optional nested `patrol_session` when loaded (`id`, `status`, `started_at`, `ended_at`). Timeline ordering for movement uses device `**timestamp`\*\*, not `created_at`.
+
+### Patrol routes schema and API status
+
+The `**patrol_routes**` table is **legacy compatibility storage** for sessions that never received usable `location_logs`. Canonical patrol movement is stored in `**location_logs**` (ingested via `POST /api/location-logs` or `POST /api/pwa/sync`).
+
+- Migration: `2026_05_11_120000_create_patrol_routes_table.php`
+- Model: `App\Models\PatrolRoute` (UUID PK via `**HasUuids**`; `**UPDATED_AT**` disabled)
+- Relationship: `**PatrolSession::patrolRoutes()**` **hasMany**
+- API: `**PatrolRouteController@index**` + deprecated `**@store**` under `**auth:api**`
+- `**GET /api/patrol-routes**` (monitoring compatibility): `PatrolMovementService` reads drawable `location_logs` for the session; falls back to `patrol_routes` **only** when the session has **no usable** location logs; **never merges** both tables. Optional filter `**patrol_session_id**`; ordered `**recorded_at` ascending**; paginated (default `**per_page` 500**, max **1000**). Used by admin patrol monitoring map (`feature/patrol-monitoring`).
+- `**POST /api/patrol-routes**`: **deprecated** (Deprecation header + `deprecated: true` body). Retained for old clients only; SPA must **not** dual-write. Prefer `POST /location-logs` or `POST /pwa/sync`.
+- **No** seeder or factory
+
+See [`../docs/system-update/patrol-location-logs-canonical-movement.md`](../docs/system-update/patrol-location-logs-canonical-movement.md).
+
+**Request semantics (legacy POST only):** `**patrol_session_id`** required (**must exist** in `**patrol_sessions`**). If `**patrol_log_id**` is sent alone (legacy SPA alias), it is merged into `**patrol_session_id**` in `**prepareForValidation**` before validation — **not** persisted as a separate column. Optional `**guard_id**` is ignored on persist. `**recorded_at**` or browser `**timestamp**` (epoch ms) sets `**recorded_at**`; otherwise `**now()**`.
+
+### Realtime broadcasting (Milestone 5 — Laravel Reverb)
+
+**Package:** `laravel/reverb` (Pusher-compatible). Set `**BROADCAST_CONNECTION=reverb`** and run `**php artisan reverb:start\*\*` for local WebSockets.
+
+| Item       | Detail                                                                                                                                                                                                                                   |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Auth       | `**POST /api/broadcasting/auth**` inside `**auth:api**` — SPA sends JWT `Authorization: Bearer …`                                                                                                                                        |
+| Channels   | `**private-patrol.monitoring**`, `**private-patrol.session.{patrolSessionId}**` — **Admin** and **Security Operator** (`App\Support\PatrolChannelAuthorizer::canAccessPatrolMonitoring`)                                                 |
+| Dispatcher | `**App\Services\PatrolBroadcastService`\*\* — no-op when `BROADCAST_CONNECTION` is `null` or `log`                                                                                                                                       |
+| Events     | `PatrolSessionStarted`, `PatrolSessionCompleted`, `PatrolCheckpointVerified`, `PatrolCheckpointSuspicious` (`suspicious` + `uncertain`), `PatrolRouteUpdated`, `PatrolValidationCompleted` (`App\Events\Patrol\*`, `ShouldBroadcastNow`) |
+
+**Broadcast triggers (existing controllers; REST responses unchanged):**
+
+| Trigger                                                             | Event(s)                                                             |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `PatrolSessionController@store` (status `active`)                   | `PatrolSessionStarted`                                               |
+| `PatrolSessionController@update` (status → `completed` / `aborted`) | `PatrolSessionCompleted`                                             |
+| `LocationLogController@store`                                       | `PatrolRouteUpdated` (primary — compact payload; `id` = `location_logs.id`) |
+| `PwaSyncController@sync` (successful `location_log` ingest)         | `PatrolRouteUpdated` (primary — same compact payload)                 |
+| `PatrolRouteController@store`                                       | `PatrolRouteUpdated` (**legacy** — deprecated POST path only)        |
+| `CheckpointEventController@store` / `@update`                       | `PatrolCheckpointVerified` or `PatrolCheckpointSuspicious` by status |
+| `PatrolSessionController@validateSession`                           | `PatrolValidationCompleted`                                          |
+
+**Example `PatrolRouteUpdated` payload:** `{ patrol_session_id, id?, latitude, longitude, accuracy, recorded_at }`.
+
+**Example `PatrolCheckpointVerified` payload:** `{ patrol_session_id, checkpoint_event_id, checkpoint_id, status, confidence_score, detected_at, checkpoint, event }`.
+
+**Env (see `.env.example`):** `REVERB_APP_ID`, `REVERB_APP_KEY`, `REVERB_APP_SECRET`, `REVERB_HOST`, `REVERB_PORT`, `REVERB_SCHEME`.
+
+### PWA location sync endpoint (`POST /api/pwa/sync`)
+
+Dedicated ingest for the SPA `**sync_queue`** (**JWT** `**auth:api`\*\*):
+
+- Controller: `**PwaSyncController@sync**`
+- Form request: `**SyncPwaLocationLogRequest**` (`**type: location_log**`, camelCase fields `**patrolId**`, `**locationLogId**`, `**userId**`, `**trackingState**`, etc.)
+- Idempotency: client `**locationLogId**` becomes `**location_logs.id**` (UUID). Replays with the **same payload** return **200** with `**success: true`** and `**data.duplicate: true**`. Replays with a **different payload** for the same id return **409 Conflict\*\*.
+- First insert returns **201** with `**data.duplicate: false`**. Validation errors use the standard API **422\*\* envelope (`success: false`, `data.errors`).
+- `**source**` must be one of `**live**`, `**resume**`, or `**sync**` (matches `location_logs.source` enum; invalid values return **422**).
+- **Client delivery:** the PWA classifies outcomes (`synced`, `duplicate_synced`, `validation_failed`, `conflict`, `failed`, `exhausted`) and may flush via `**online`**, **Retry Sync**, or **Background Sync\*\*.
+
+### Cameras schema and API status
+
+The `cameras` module is implemented and wired:
+
+- Migration: `2026_05_07_170000_create_cameras_table.php`
+- Model: `App\Models\Camera` (UUID primary key; UUID generated on create; casts `is_active` and `last_seen_at`)
+- API: `CameraController` + `StoreCameraRequest` / `UpdateCameraRequest` + `Route::apiResource('cameras', ...)` under `auth:api`
+- Seeding: `CameraSeeder` registered in `DatabaseSeeder`
+- Factory: `CameraFactory`
+
+### Vehicles schema and API status
+
+The `vehicles` module is implemented and wired:
+
+- Migration: `2026_05_07_180000_create_vehicles_table.php`
+- Model: `App\Models\Vehicle` (UUID primary key via Laravel `HasUuids`; non-incrementing string key)
+- API: `VehicleController` + `Route::apiResource('vehicles', ...)` under `auth:api`
+- Seeding: `VehicleSeeder` registered in `DatabaseSeeder`
+- Factory: `VehicleFactory`
+
+### ANPR events schema and API status
+
+The `anpr_events` module is implemented and wired:
+
+- Migration: `2026_05_07_190000_create_anpr_events_table.php`
+- Model: `App\Models\AnprEvent` (UUID primary key via Laravel `HasUuids`; non-incrementing string key; casts for confidence/time/flags/coordinates)
+- API: `AnprEventController` + `Route::apiResource('anpr-events', ...)` under `auth:api`
+- Resource: `AnprEventResource` — nested `camera` via `AnprCameraResource` (monitoring-safe: `id`, `name`, `location`, `is_active`, `last_seen_at`; omits `ip_address`, `port`, `username`, `password`, `rtsp_url`); nested `vehicle` via `AnprVehicleResource`; nested `images` via `AnprImageResource`
+- **M10 index filters:** `per_page`, `page`, `plate_number`, `search` (alias for plate partial match), `is_valid`, `is_flagged`, `date_from`, `date_to`, `camera_id`
+- Seeding: `AnprEventSeeder` registered in `DatabaseSeeder` (uses existing cameras; optional vehicle/blockchain linkage when available)
+- Factory: `AnprEventFactory`
+- Tests: `tests/Feature/AnprMonitoringTest.php` (filters, safe camera serialization)
+
+### ANPR images schema and API status
+
+The `anpr_images` module is implemented and wired:
+
+- Migration: `2026_05_07_200000_create_anpr_images_table.php`
+- Model: `App\Models\AnprImage` (UUID primary key via Laravel `HasUuids`; non-incrementing string key; `HasFactory`)
+- API: `AnprImageController` + `Route::apiResource('anpr-images', ...)` under `auth:api`
+- **M10 file proxy:** `GET /api/anpr-images/{anpr_image}/file` (`anpr-images.file`) — `AnprImageFileService` resolves `file_path` only when the real path stays within `config('anpr.image_roots')` (from `ANPR_IMAGE_ROOTS` env; default `storage/app/anpr`)
+- Resource: `AnprImageResource` — adds `url` and `image_url` when the file is resolvable (points to the authenticated file route)
+- Factory: `AnprImageFactory`
+
+### ANPR event logs schema and API status
+
+The `anpr_event_logs` module is implemented and wired:
+
+- Migration: `2026_05_07_210000_create_anpr_event_logs_table.php`
+- Model: `App\Models\AnprEventLog` (UUID primary key via Laravel `HasUuids`; non-incrementing string key)
+- API: `AnprEventLogController` + `Route::apiResource('anpr-event-logs', ...)` under `auth:api`
+- **No** seeder or factory
+- **Note:** Consumed by the AI runtime for audit stages (`ai_event_created`, `ai_images_registered`, etc.); the M10 React monitoring UI does **not** render logs.
+
+### Important migrations (file names)
+
+**Core domain**
+
+- `2026_05_06_233500_create_roles_table.php`
+- `2026_05_06_235400_create_users_table.php`
+- `2026_05_07_010225_create_zones_table.php`
+- `2026_05_07_094600_create_checkpoints_table.php`
+- `2026_05_07_120000_create_patrol_sessions_table.php`
+- `2026_05_07_141500_create_checkpoint_events_table.php`
+- `2026_05_07_150000_create_checkpoint_event_metrics_table.php`
+- `2026_05_07_161000_create_location_logs_table.php`
+- `2026_05_11_120000_create_patrol_routes_table.php`
+- `2026_05_07_170000_create_cameras_table.php`
+- `2026_05_07_180000_create_vehicles_table.php`
+- `2026_05_07_190000_create_anpr_events_table.php`
+- `2026_05_07_200000_create_anpr_images_table.php`
+- `2026_05_07_210000_create_anpr_event_logs_table.php`
+- `2026_05_19_120000_add_manual_to_checkpoint_events_detection_type.php`
+- `2026_05_20_120000_create_push_subscriptions_table.php`
+- `2026_07_04_100000_update_checkpoint_events_status_for_m8.php`
+
+**Blockchain**
+
+- `2026_05_07_004434_create_blockchain_records_table.php`
+- `2026_06_24_090004_create_jobs_table.php`
+- `2026_06_24_100000_create_blockchain_jobs_table.php`
+- `2026_06_24_100001_create_blockchain_verifications_table.php`
+- `2026_06_29_120000_update_blockchain_records_unique_constraint_for_profile_proofs.php`
+- `2026_07_06_180000_add_context_tx_hash_to_blockchain_jobs.php`
+
+**Authentication & profile**
+
+- `2026_06_27_120000_create_refresh_tokens_table.php`
+- `2026_06_28_120000_add_setup_required_to_users_table.php`
+- `2026_06_28_120100_create_password_setup_tokens_table.php`
+- `2026_06_29_100000_add_two_factor_confirmed_at_to_users_table.php`
+- `2026_06_29_100100_create_auth_login_challenges_table.php`
+- `2026_06_29_100200_create_two_factor_setup_sessions_table.php`
+- `2026_06_30_100000_widen_two_factor_secret_column_on_users_table.php`
+- `2026_06_30_100000_add_attempt_tracking_to_two_factor_setup_sessions_table.php`
+- `2026_07_01_100000_create_auth_audit_logs_table.php`
+- `2026_07_02_100000_add_status_to_auth_audit_logs_table.php`
+- `2026_07_03_100000_add_last_security_changed_at_to_users_table.php`
+- `2026_07_03_100100_create_profile_change_tokens_table.php`
+
+**Cameras (credentials)**
+
+- `2026_07_01_100000_add_camera_credentials_to_cameras_table.php`
+- `2026_07_01_110000_sanitize_legacy_camera_passwords.php` (data migration only)
+
+---
+
+## 6. Authentication & authorization
+
+**Login Module baseline (M0):** Current JWT auth behavior, protected API inventory, gap analysis, and migration path are documented in [`docs/login/m0-auth-baseline-and-current-audit.md`](docs/login/m0-auth-baseline-and-current-audit.md). Target design: [`../docs/login-module.md`](../docs/login-module.md).
+
+**Login Module M1 (refresh sessions):** DB-backed refresh tokens, `POST /api/auth/refresh`, and HttpOnly cookie behavior are documented in [`docs/login/m1-laravel-session-foundation-and-refresh-tokens.md`](docs/login/m1-laravel-session-foundation-and-refresh-tokens.md).
+
+**Login Module M2 (frontend refresh-on-401):** React API client refresh queue, single retry, and session-expired UX are documented in [`docs/login/m2-frontend-refresh-on-401-architecture.md`](docs/login/m2-frontend-refresh-on-401-architecture.md). No backend runtime changes in M2.
+
+**Login Module M3 (patrol token expiry safety):** PWA `flushSyncQueue()` continuity via shared `api.js` refresh-on-401 is documented in [`docs/login/m3-patrol-token-expiry-safety.md`](docs/login/m3-patrol-token-expiry-safety.md). Verification tests only; no backend runtime changes in M3.
+
+**Login Module M4 (first-login password setup):** Setup-required users, hashed setup tokens, and password completion API are documented in [`docs/login/m4-first-login-password-setup.md`](docs/login/m4-first-login-password-setup.md).
+
+**Login Module M5 (mandatory TOTP 2FA):** TOTP enrollment, login OTP challenges, setup-session attempt limiting, and session gating are documented in [`docs/login/m5-totp-two-factor-authentication.md`](docs/login/m5-totp-two-factor-authentication.md).
+
+**Login Module M6 (rate limiting, lockout, OTP protection):** Login rate limiting by email + IP, temporary lockout, minimal `auth_audit_logs`, soft-deleted user disablement, and refresh revocation on disable are documented in [`docs/login/m6-rate-limiting-lockout-and-otp-protection.md`](docs/login/m6-rate-limiting-lockout-and-otp-protection.md).
+
+**Login Module M7 (auth audit logs and session monitoring):** Extended audit coverage, Admin audit API, session list/revoke/logout-all APIs, and Admin React monitoring UI are documented in [`docs/login/m7-auth-audit-logs-and-session-monitoring.md`](docs/login/m7-auth-audit-logs-and-session-monitoring.md).
+
+**Login Module M8 (route guards and middleware hardening):** `EnsureUserIsActive` on protected routes, role middleware groups, and frontend `getAuthSessionState()` alignment are documented in [`docs/login/m8-route-guards-role-policies-and-middleware-hardening.md`](docs/login/m8-route-guards-role-policies-and-middleware-hardening.md).
+
+**Login Module M9 (security settings and account recovery):** Admin 2FA reset, password-change session invalidation (refresh revocation + JWT `iat` check), account security UI, and audit events `two_factor_reset` / `password_changed` are documented in [`docs/login/m9-security-settings-and-account-recovery-edge-cases.md`](docs/login/m9-security-settings-and-account-recovery-edge-cases.md).
+
+**Login Module M10 (final hardening and documentation freeze):** Regression umbrella tests, acceptance matrix, manual demo checklist, and verification evidence are documented in [`docs/login/m10-final-hardening-testing-and-documentation-freeze.md`](docs/login/m10-final-hardening-testing-and-documentation-freeze.md).
+
+**Profile Module M0 (audit and architecture freeze):** M0 baseline inspection, reusable components, frozen security decisions, acceptance matrix, and historical gap analysis (gaps since resolved in M1–M15) are documented in [`docs/profile/m0-profile-module-audit-and-architecture-freeze.md`](docs/profile/m0-profile-module-audit-and-architecture-freeze.md). Target design: [`../docs/profile-module.md`](../docs/profile-module.md). Profile APIs were **not implemented** at M0 (implemented in M1–M7).
+
+**Profile Module M1 (backend data foundation):** Adds `users.last_security_changed_at`, `profile_change_tokens` table, `ProfileChangeToken` model/factory, and `config/profile.php`. Documented in [`docs/profile/m1-profile-backend-data-foundation.md`](docs/profile/m1-profile-backend-data-foundation.md).
+
+**Profile Module M2 (backend profile read/update API):** Adds `GET /api/profile` and `PATCH /api/profile` for self-service phone/address updates with optimistic `profile_version` concurrency. Documented in [`docs/profile/m2-profile-backend-read-update-api.md`](docs/profile/m2-profile-backend-read-update-api.md).
+
+**Profile Module M3 (backend profile picture upload):** Adds `POST /api/profile/picture` and `DELETE /api/profile/picture` with server-side storage, safe URL resolution, and sanitized audit events. Documented in [`docs/profile/m3-profile-backend-profile-picture-upload.md`](docs/profile/m3-profile-backend-profile-picture-upload.md). At M3, frontend profile picture UI was deferred to M10 (implemented in M10).
+
+**Profile Module M4 (backend step-up verification foundation):** Adds `ProfileSecurityService` (step-up verification, profile change tokens, sensitive-change session revocation) and extends `EnsureUserIsActive` stale-JWT checks. No new profile HTTP endpoints. Documented in [`docs/profile/m4-profile-backend-step-up-verification-foundation.md`](docs/profile/m4-profile-backend-step-up-verification-foundation.md). At M4, password/email/2FA profile flows were deferred to M5–M7 (implemented in M5–M7).
+
+**Profile Module M5 (backend change password flow):** Adds `POST /api/profile/password/change` with step-up verification, session revocation, and sanitized `password_changed` audit logging. Documented in [`docs/profile/m5-profile-backend-change-password-flow.md`](docs/profile/m5-profile-backend-change-password-flow.md). At M5, frontend change-password dialog was deferred to M11.1 (implemented in M11). Profile blockchain proof creation was deferred to M13 (implemented in M13).
+
+**Profile Module M6 (backend change email flow):** Adds `POST /api/profile/email/start` and `POST /api/profile/email/confirm` with step-up verification, encrypted pending tokens, email delivery, and sanitized audit logging. Documented in [`docs/profile/m6-profile-backend-change-email-flow.md`](docs/profile/m6-profile-backend-change-email-flow.md). At M6, frontend change-email dialog was deferred to M11.2 (implemented in M11). Profile blockchain proof was deferred to M13 (implemented in M13).
+
+**Profile Module M7 (backend 2FA reconfiguration):** Adds `POST /api/profile/2fa/reconfigure/start` and `POST /api/profile/2fa/reconfigure/verify` for self-service authenticator replacement without disablement. Step-up on start, encrypted pending secret token, session revocation on verify, sanitized audit logging. Documented in [`docs/profile/m7-profile-backend-2fa-reconfiguration.md`](docs/profile/m7-profile-backend-2fa-reconfiguration.md). At M7, frontend 2FA reconfiguration UI was deferred to M11.3 (implemented in M11). Profile blockchain proof was deferred to M13 (implemented in M13).
+
+**Profile Module M8 (frontend profile foundation):** Frontend-only milestone. Adds `feature/profile`, protected `/account/profile` for all initialized roles, and Account Settings menu wiring. Documented in [`docs/profile/m8-frontend-profile-foundation.md`](docs/profile/m8-frontend-profile-foundation.md). At M8, contact edit, profile picture, and sensitive-change dialogs were deferred to M9–M11 (implemented in M9–M11).
+
+**Profile Module M9 (frontend profile view and non-sensitive update):** Frontend-only milestone. Extends `/account/profile` with profile summary UI, phone/address update form, optimistic `profile_version` handling, validation and conflict UX, `auth_user` sync, and cross-tab profile events. Documented in [`docs/profile/m9-frontend-profile-view-and-non-sensitive-update.md`](docs/profile/m9-frontend-profile-view-and-non-sensitive-update.md). At M9, sensitive-change dialogs were deferred to M11 (implemented in M11).
+
+**Profile Module M10 (frontend profile picture UI):** Frontend-only milestone. Adds profile picture upload/removal UI on `/account/profile` using existing M3 `POST`/`DELETE /api/profile/picture` endpoints, client-side validation hints, normalized repository responses, `auth_user` and header avatar sync, and cross-tab profile events. Documented in [`docs/profile/m10-frontend-profile-picture-ui.md`](docs/profile/m10-frontend-profile-picture-ui.md). At M10, sensitive-change dialogs and offline queue were deferred to M11–M12 (implemented in M11–M12).
+
+**Profile Module M11 (frontend sensitive change flows):** Frontend-only milestone. Adds change password, change email (start + confirm), and 2FA reconfiguration dialogs on `/account/profile` using existing M5–M7 APIs. Successful flows clear local auth and redirect to `/login`; sensitive actions are disabled offline. No user-facing 2FA disable path. Documented in [`docs/profile/m11-frontend-sensitive-change-flows.md`](docs/profile/m11-frontend-sensitive-change-flows.md). At M11, offline contact queue was deferred to M12 (implemented in M12); blockchain proof UI to M13 (implemented in M13).
+
+**Profile Module M12 (PWA offline profile queue):** Frontend/PWA milestone. Adds isolated Dexie `profile_update_queue` for offline `phone`/`address` updates, flush through existing `PATCH /api/profile` via shared `api.js`, `profile_version` conflict recovery UI, and patrol `sync_queue` type guard. Documented in [`docs/profile/m12-pwa-offline-profile-queue.md`](docs/profile/m12-pwa-offline-profile-queue.md).
+
+**Profile Module M13 (blockchain integration for profile changes):** Backend milestone. Anchors committed password change, email confirmation, and 2FA reconfiguration verification through `ProfileBlockchainService` → `BlockchainRecordService::createForPayload()` with `entity_type = user_profile` and proof types `profile_password_changed`, `profile_email_changed`, `profile_2fa_reconfigured`. Safe payloads only; API does not wait for on-chain confirmation. Documented in [`docs/profile/m13-blockchain-integration-for-profile-changes.md`](docs/profile/m13-blockchain-integration-for-profile-changes.md).
+
+**Profile Module M14 (audit, monitoring, and hardening):** Hardens M0–M13 without redesign. Adds `password_change_failed` audit event; failure audits for password/email step-up and email confirm; `email_change_confirm` rate-limit scope; allow-list validation on all Profile FormRequests via `RejectsUnexpectedProfileFields`; Auth Monitoring profile action filters in frontend. Documented in [`docs/profile/m14-audit-monitoring-and-hardening.md`](docs/profile/m14-audit-monitoring-and-hardening.md).
+
+**Profile Module M15 (final documentation, demo checklist, and module freeze):** Freezes the Profile Module after M0–M14 verification. Documents final backend API contracts, audit coverage, blockchain proof coverage, manual demo checklist, final test evidence, known limitations, and post-freeze change-control rules. See [`docs/profile/m15-final-documentation-demo-checklist-and-module-freeze.md`](docs/profile/m15-final-documentation-demo-checklist-and-module-freeze.md).
+
+### Authentication method
+
+- **JWT** using `**php-open-source-saver/jwt-auth`\*\*.
+- Guard `**api**` in `config/auth.php` uses driver `**jwt**`, provider `**users**` (Eloquent `App\Models\User`).
+- Guard `**camera**` uses driver `**jwt**`, provider `**cameras**` (Eloquent `App\Models\Camera`) for machine ANPR authentication.
+- `User` and `Camera` implement `PHPOpenSourceSaver\JWTAuth\Contracts\JWTSubject` with custom claim `principal_type` (`user` or `camera`). `EnsureUserIsActive` rejects user routes when `principal_type !== 'user'`.
+
+### Session / web guard
+
+- Guard `**web**` remains **session**-based (default Laravel). The `**/`\*\* route does not use API JWT.
+
+### Token flow
+
+1. `POST /api/auth/login` validates credentials with `Hash::check` (no JWT before OTP). **M6:** rate-limited by normalized email + IP; **429** lockout after repeated failures; soft-deleted users receive the same **401** as invalid credentials. Branches: `password_setup_required`, `two_factor_setup_required`, or `otp_required` — each returns short-lived tokens/challenge IDs without JWT or refresh cookie when setup or 2FA is incomplete (**M4/M5**).
+2. On success after OTP verification (`POST /api/auth/otp/verify`) or 2FA setup verification (`POST /api/auth/2fa/setup/verify`), returns `access_token`, `token_type`, `expires_in`, authenticated `user`, and the user's `role`, and sets an HttpOnly `refresh_token` cookie.
+3. On success for users with `setup_required = true`, returns `next_step = password_setup_required` with a one-time `setup_token`, and does **not** set access token or refresh cookie (**M4**).
+4. `POST /api/auth/password-setup/complete` (public) validates a setup token and new password, sets `setup_required = false` and `last_password_changed_at`, and returns `next_step = two_factor_setup_required` with `two_factor_setup_token` without issuing JWT or refresh cookie (**M4/M5**).
+5. `POST /api/auth/2fa/setup/start` and `POST /api/auth/2fa/setup/verify` (public) handle mandatory TOTP enrollment; verify success issues JWT + refresh cookie (**M5**).
+6. `POST /api/auth/otp/verify` (public) validates login OTP challenges and issues JWT + refresh cookie (**M5**).
+7. `POST /api/auth/refresh` (public route) reads the refresh cookie, validates the session, and **rejects users with `setup_required = true`, `two_factor_enabled = false`, or soft-deleted (`deleted_at`)** by revoking the refresh row and clearing the cookie (**401**). Otherwise it rotates the DB session inside a transaction with row locking and returns a new access token JSON payload plus a new cookie.
+8. Clients send `Authorization: Bearer <token>` for protected routes under `Route::middleware(['auth:api', 'active.user'])`. **`POST /api/auth/logout` is public** so the HttpOnly refresh cookie can be revoked even when the bearer JWT is missing or expired.
+9. Admin-only routes are wrapped with `Route::middleware('admin')`; non-admin users receive **403 Forbidden** JSON. Patrol monitoring list routes use `patrol.monitoring` (**Admin + Security Operator**). ANPR write routes use `auth.anpr-write` (camera JWT **or** active **Admin** user JWT).
+10. `POST /api/auth/logout` always clears the refresh cookie and revokes the matching DB refresh row when present; invalidates the JWT only when a valid bearer token is supplied. `GET /api/auth/me` returns the authenticated profile and role.
+11. Access-token TTL on login/refresh uses `AUTH_ACCESS_TOKEN_TTL` via `config/auth_security.php` (minutes; default **30**). `expires_in` in responses is **seconds** (`getTTL() * 60`). Refresh session TTL: `AUTH_REFRESH_TOKEN_TTL_HOURS` (default **12** hours). Camera JWT TTL: `AUTH_CAMERA_TOKEN_TTL` (default **60** minutes).
+12. **Browser credentialed CORS:** `config/cors.php` sets `supports_credentials: true` and explicit `CORS_ALLOWED_ORIGINS` (no `*`). Required when React (e.g. `localhost:5173`) and Laravel (`localhost:8000`) run on different origins. **Refresh cookie name:** `AUTH_REFRESH_COOKIE_NAME` must match across `.env`, `config/auth_security.php`, and `bootstrap/app.php` (`encryptCookies` except uses the same env variable).
+
+### Authorization beyond JWT
+
+| Mechanism                                            | Behavior                                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `EnsureUserIsAdmin`                                  | Loads `role`; allows action only if role name is `Admin` (case-insensitive); otherwise **403** JSON.                                                                                                                                                                                                                           |
+| `PatrolChannelAuthorizer::canAccessPatrolMonitoring` | **Admin** or **Security Operator** — used for Reverb channels and `AuthorizesPatrolMonitoring` on monitoring list endpoints (`GET` patrol-sessions index/show, `GET` patrol-routes, `GET` checkpoint-events). Guard patrol flows still use `POST`/`PUT` patrol-sessions, `GET` summary, `POST` validate, `POST` patrol-routes. |
+| Laravel Policies / Gates                             | **Not implemented** (no policy classes).                                                                                                                                                                                                                                                                                       |
+| Route middleware on users/roles                        | All under `auth:api`; additionally restricted by `admin` middleware.                                                                                                                                                                                                                                                           |
+| Route middleware on blockchain-records                 | All `GET/POST /api/blockchain-records/*` under `auth:api` + `admin` middleware; **Admin only**.                                                                                                                                                                                                                                |
+
+### Seeded roles
+
+From `RoleSeeder`: `**Admin`**, `**Security Operator**`, `**Guard\*\*`. Admin middleware permits only users whose role resolves to `Admin`.
+
+---
+
+## 7. Services & business logic
+
+### Service classes
+
+| Class | Role |
+| ----- | ---- |
+| `App\Services\Auth\RefreshTokenService` | HttpOnly refresh cookie, DB-backed rotation, family reuse detection, session revoke |
+| `App\Services\Auth\TwoFactorService` | TOTP generate/verify (SHA1, 6-digit, 30s); encrypted secret storage |
+| `App\Services\Auth\TwoFactorSetupService` | First-login 2FA setup sessions |
+| `App\Services\Auth\AuthLoginChallengeService` | Login OTP challenges |
+| `App\Services\Auth\PasswordSetupService` | First-login password setup tokens |
+| `App\Services\Auth\AuthAuditService` | Central auth/profile audit logging |
+| `App\Services\Auth\LoginRateLimiter` | Login + camera login + OTP rate limits |
+| `App\Services\Auth\AuthAccountRecoveryService` | Admin 2FA reset |
+| `App\Services\Auth\CameraAuthService` | Camera machine login, JWT issuance, RTSP report |
+| `App\Services\Auth\CameraAccessValidator` | Camera credential_enabled + is_active checks |
+| `App\Services\Profile\ProfileService` | Non-sensitive profile read/update, `profile_version` |
+| `App\Services\Profile\ProfileSecurityService` | Step-up verification, change tokens, session revocation |
+| `App\Services\Profile\ProfilePictureService` | Profile picture upload/delete |
+| `App\Services\Profile\ProfileEmailService` | Email change start/confirm flow |
+| `App\Services\Profile\ProfilePasswordService` | Password change flow |
+| `App\Services\Profile\ProfileTwoFactorReconfigureService` | 2FA reconfiguration (replace only) |
+| `App\Services\Profile\ProfileStepUpRateLimiter` | Step-up rate limits for sensitive profile actions |
+| `App\Services\Profile\ProfileBlockchainService` | Profile sensitive-change blockchain proofs |
+| `App\Services\PatrolSessionSummaryService` | Gap-aware patrol session summary (`GET …/summary`) |
+| `App\Services\PatrolValidationService` | Validation engine (`POST …/validate`); M8-tuned thresholds via `config/patrol_validation.php` |
+| `App\Services\PatrolBroadcastService` | Reverb patrol monitoring events + push side effects |
+| `App\Services\PatrolPushNotificationService` | Web Push payloads for patrol events |
+| `App\Services\Anpr\AnprImageFileService` | Allowed-root evidence file resolution |
+| `App\Services\Dashboard\DashboardSummaryService` | Role-aware `GET /api/dashboard/summary` |
+| `App\Services\Blockchain\BlockchainRecordService` | Idempotent proof row creation, queue dispatch |
+| `App\Services\Blockchain\BlockchainHashService` | Canonical JSON + SHA-256 hashing |
+| `App\Services\Blockchain\BlockchainAnprIntegrationService` | ANPR event/image auto-proof |
+| `App\Services\Blockchain\BlockchainPatrolIntegrationService` | Patrol validation result proof |
+| `App\Services\Blockchain\BlockchainVerificationService` | On-chain + local hash verification |
+| `App\Services\Blockchain\BlockchainRetryService` | Exponential backoff for failed anchors |
+| `App\Services\Blockchain\BlockchainSubmittedRecordRefreshService` | Poll submitted tx receipts |
+| `App\Services\Blockchain\EthereumRpcClient` | JSON-RPC `storeHash` / `verifyHash` / receipts |
+| `App\Services\Blockchain\EthereumTransactionSigner` | Sepolia signed tx submission |
+| `App\Services\WebPushNotificationService` | Outbound Web Push delivery |
+
+**Push subscriptions (Milestone 15) + outbound push (Milestone 9):** `push_subscriptions` stores Web Push endpoints + keys. `**POST /api/push-subscriptions`** upserts by `endpoint`; `**DELETE /api/push-subscriptions/{id}\*\*` removes a row.
+
+**Web Push services:**
+
+| Class                           | Role                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WebPushNotificationService`    | Low-level sender (`minishlink/web-push`): `sendToUser`, `sendToAdmins`, `sendToRole`, `sendToSubscription`. Returns `**WebPushDeliveryResult`** aggregates (`attempted`, `succeeded`, `failed`, `expired`, …). Logs successful sends, delivery failures, expired subscriptions (HTTP **410** / **404\*\*), and payload validation issues. Payload shape: `title`, `body`, `icon`, `badge`, `url`, `tag`, `data`. |
+| `WebPushDeliveryResult`         | Value object aggregating per-subscription Web Push outcomes; exposed on the test endpoint via `data`.                                                                                                                                                                                                                                                                                                            |
+| `PatrolPushNotificationService` | Patrol-domain payloads; called from `PatrolBroadcastService` alongside Reverb events. Swallows push errors so patrol APIs never fail because of notification delivery.                                                                                                                                                                                                                                           |
+
+**Environment (`.env`):**
+
+| Variable            | Purpose                                     |
+| ------------------- | ------------------------------------------- |
+| `VAPID_PUBLIC_KEY`  | Must match frontend `VITE_VAPID_PUBLIC_KEY` |
+| `VAPID_PRIVATE_KEY` | Server only — never expose to the SPA       |
+| `VAPID_SUBJECT`     | Contact URI (defaults to `APP_URL`)         |
+
+Config file: `config/webpush.php`.
+
+**Delivery mode:** Synchronous inside the HTTP request (wrapped in `try/catch` so patrol/validation APIs never fail because of push). `QUEUE_CONNECTION=database` is set in `.env.example`, but **no `jobs` migration** ships with this repo yet — queue-based push is **not** required for Milestone 9.
+
+**Failed subscriptions:** HTTP **410** / **404** from the push endpoint deletes the `push_subscriptions` row automatically.
+
+**Notification triggers (via `PatrolBroadcastService` → `PatrolPushNotificationService`):**
+
+| Event                                                                      | Recipients                          | Deep link                                                          |
+| -------------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------ |
+| Patrol **completed**                                                       | Admin + Security Operator           | `/admin/patrol-monitoring/{patrolSessionId}`                       |
+| Patrol **aborted**                                                         | Admin + Security Operator           | same                                                               |
+| Checkpoint **suspicious** / **uncertain** (status change on create/update) | Admin + Security Operator           | same                                                               |
+| **Validation completed** (`POST …/validate`)                               | Admin + Security Operator           | same (body includes verified/suspicious/uncertain/rejected counts) |
+| Checkpoint(s) **rejected** after validation                                | Patrol guard (`user_id` on session) | `/patrol`                                                          |
+
+Reverb WebSocket broadcasts remain unchanged; push is complementary.
+
+**Test endpoint:** `POST /api/push-notifications/test` — JWT required; sends only to the current user’s subscriptions. Response `success` is **true** only when at least one subscription is delivered; partial multi-device failures still return **200** with counts in `data`.
+
+### Business rules (from controllers/models)
+
+| Area                     | Rule                                                                                                                                                                                                                                                                                      |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Users                    | Unique email on create; optional soft-delete listing; restore by id                                                                                                                                                                                                                       |
+| Zones                    | Unique `name` on create/update; `created_by` optional must exist in `users`; admin-only writes                                                                                                                                                                                            |
+| Checkpoints              | Unique `name` per `zone_id`; filter/search support on index; hard delete (`forceDelete`)                                                                                                                                                                                                  |
+| Patrol sessions          | Session lifecycle tracking by user + zone with optional blockchain linkage; filterable/sortable index; hard delete (`forceDelete`); `**summary`** computes read-only gaps + completion; `**validate\*\*` runs full backend validation and persists checkpoint results                     |
+| Checkpoint events        | Links a patrol session to a checkpoint with detection metadata; filterable/sortable index; permanent delete via `delete()` (no soft-delete trait)                                                                                                                                         |
+| Checkpoint event metrics | At most one metric row per checkpoint event (`checkpoint_event_id` unique); permanent delete via `delete()` (no soft-delete trait); confidence breakdown scores persisted, composite score exposed only via API resource                                                                  |
+| Location logs            | Immutable append-only evidence: `store` and PWA sync insert only; **no** HTTP update or delete; optional client UUID or server-generated `id`; `server_received_at` set on create; index listing filters by patrol session and user; `PatrolValidationService` is read-only on this table |
+| Cameras                  | **Admin-only** CRUD under `auth:api` + `admin`; machine login via `POST /api/camera-auth/login` (separate camera JWT guard); ANPR runtime uses camera token for writes |
+| Vehicles                 | **Admin-only** CRUD; ANPR ingestion auto-links via `AnprVehicleLinker` without guard access |
+| ANPR events              | **Write:** `auth.anpr-write` (camera or admin). **Read/monitoring:** `patrol.monitoring` for index/show. Admin update/delete. `camera_id` derived from camera JWT on write |
+| ANPR images              | Same write/read split as events; file proxy at `GET …/file` requires monitoring role |
+| ANPR event logs          | Camera/admin write via `auth.anpr-write`; monitoring read; admin update/delete |
+| Blockchain               | Query filters map to model scopes (`pending`, `confirmed`, `failed`, `byNetwork`, `byEnvironment`)                                                                                                                                                                                        |
+| BlockchainRecord model   | `markAsSubmitted`, `markAsConfirmed`, `markAsFailed`, `incrementRetry` — **not** exposed via HTTP controllers in this repo                                                                                                                                                                |
+
+### Queue jobs
+
+| Job | Trigger | Behavior |
+| --- | ------- | -------- |
+| `App\Jobs\AnchorBlockchainRecordJob` | `BlockchainRecordService::maybeQueueForAnchoring()` when `BLOCKCHAIN_ENABLED=true` | Submits `record_hash` to Ethereum contract; business retries via `BlockchainRetryService` |
+| `App\Jobs\RefreshSubmittedBlockchainRecordJob` | After tx submission or manual refresh | Polls receipt until `BLOCKCHAIN_CONFIRMATION_BLOCKS` met |
+
+When `QUEUE_CONNECTION=database`, run `php artisan queue:work` (or supervised systemd service in production). Blockchain anchoring and refresh depend on the worker.
+
+### Events / listeners
+
+Six patrol monitoring events under `app/Events/Patrol/` implement `ShouldBroadcastNow` and are dispatched from `PatrolBroadcastService`:
+
+- `PatrolSessionStarted`, `PatrolSessionCompleted`, `PatrolRouteUpdated`, `PatrolCheckpointVerified`, `PatrolCheckpointSuspicious`, `PatrolValidationCompleted`
+
+Channels: `private-patrol.monitoring`, `private-patrol.session.{patrolSessionId}` (see `routes/channels.php`). No separate `app/Listeners` directory.
+
+### Scheduled tasks
+
+Unable to determine from current implementation — **no** application-level `schedule()` definitions found outside `vendor/`. `routes/console.php` only registers the `inspire` demo command.
+
+### Core workflows
+
+- **User lifecycle:** CRUD + soft delete + restore via `UserController`; passwords hashed via model cast on `User`.
+- **Zone lifecycle:** Authenticated users read; admins mutate; responses wrapped with `success` / `message` in `ZoneController`; zone payloads include `checkpoints_count` via `checkpoints` relationship counting.
+- **Checkpoint lifecycle:** Authenticated users can CRUD checkpoints with zone eager loading, index filtering/search, and `204` hard delete response.
+- **Patrol session lifecycle:** Authenticated users can CRUD patrol sessions with user/zone/blockchain-record eager loading, index filtering/sort, and `204` hard delete response. `**GET …/summary`** returns a computed gap-aware summary without persisting a summary row. `**POST …/validate\*\*`runs`PatrolValidationService` and upserts authoritative checkpoint events + metrics.
+- **Checkpoint events lifecycle:** Authenticated users can CRUD checkpoint events with `patrolSession` / `checkpoint` / `metric` eager loading, index filtering/sort by `detected_at`, `201` on create, and `204` empty response on delete.
+- **Checkpoint event metrics lifecycle:** Authenticated users can CRUD checkpoint event metrics with `checkpointEvent` eager loading, paginated index (`per_page`), `201` on create, and `204` empty response on delete.
+- **Location logs lifecycle:** Authenticated users can list/filter (`patrol_session_id`, `user_id`), create single-row logs (`201`), and show (`LocationLogResource`). Rows are never updated or deleted via API after creation (raw evidence integrity).
+- **Cameras lifecycle:** Authenticated users can CRUD cameras via REST endpoints under `auth:api`; delete returns `204`.
+- **Vehicles lifecycle:** Authenticated users can CRUD vehicles with inline validation, including unique `plate_number` and constrained `status`/`source`; delete returns `204`.
+- **ANPR events lifecycle:** Authenticated users can CRUD ANPR events with eager loading of `vehicle`/`camera` and optional `images`/`logs` when tables exist; paginated index (`per_page`), `201` on create, and `204` empty response on delete.
+- **ANPR images lifecycle:** Authenticated users can CRUD ANPR image metadata linked to ANPR events with paginated/filterable index (`per_page`, `anpr_event_id`, `image_type`), `201` on create, and `204` empty response on delete.
+- **ANPR event logs lifecycle:** Authenticated users can CRUD ANPR event logs linked to ANPR events with paginated index (`per_page`), request validation for `anpr_event_id`/`stage`/`message`, `201` on create, and `204` empty response on delete.
+- **Blockchain:** Read-only API over persisted rows; model supports future worker-style status transitions that are **not** wired to routes.
+
+---
+
+## 8. Configuration
+
+### Important environment variables (from `.env.example` — **no secrets reproduced**)
+
+| Variable                                | Purpose                                                                                                      |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `APP_*`                                 | Name, env, key, debug, URL, locale                                                                           |
+| `LOG_CHANNEL`, `LOG_STACK`, `LOG_LEVEL` | Logging                                                                                                      |
+| `DB_CONNECTION`, `DB_DATABASE`, etc.    | Database (default **mysql** in `.env.example`)                                                                 |
+| `SESSION_DRIVER`, `SESSION_LIFETIME`    | Sessions (default **database** driver in example)                                                            |
+| `CACHE_STORE`                           | Cache (default **file** in `.env.example`)                                                                   |
+| `QUEUE_CONNECTION`                      | Queue (default **database** in `.env.example`; requires `jobs` table — see [§13](#13-known-issues--technical-debt)) |
+| `AUTH_ACCESS_TOKEN_TTL`, `AUTH_REFRESH_TOKEN_TTL_HOURS`, `AUTH_REFRESH_COOKIE_*`, `AUTH_LOGIN_MAX_ATTEMPTS`, `AUTH_LOGIN_LOCK_MINUTES`, `AUTH_PASSWORD_MIN_LENGTH`, `AUTH_PASSWORD_SETUP_TOKEN_TTL_HOURS`, `AUTH_OTP_CHALLENGE_TTL`, `AUTH_OTP_MAX_ATTEMPTS`, `AUTH_TWO_FACTOR_SETUP_TTL`, `AUTH_TOTP_ISSUER`, `AUTH_TOTP_WINDOW` | Login Module (`config/auth_security.php`) |
+| `AUTH_CAMERA_TOKEN_TTL`, `AUTH_CAMERA_LOGIN_MAX_ATTEMPTS`, `AUTH_CAMERA_LOGIN_LOCK_MINUTES` | Camera machine auth (`config/auth_security.php`; not all listed in `.env.example`) |
+| `PROFILE_PICTURE_*`, `PROFILE_CHANGE_TOKEN_TTL_MINUTES`, `PROFILE_STEP_UP_MAX_ATTEMPTS`, `PROFILE_STEP_UP_DECAY_SECONDS` | Profile Module (`config/profile.php`) |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated React origins for credentialed API requests (`config/cors.php`) |
+| `BLOCKCHAIN_*` | Blockchain proof layer (`config/blockchain.php`; disabled by default) |
+| `PATROL_GPS_*`, `PATROL_GAP_*`, `PATROL_MAX_SPEED_MPS`, `PATROL_ROUTE_CORRIDOR_*`, `PATROL_WEIGHT_*`, etc. | Patrol validation tuning (`config/patrol_validation.php`) |
+| `ANPR_IMAGE_ROOTS`                      | Comma-separated allow-list of directories for `GET /api/anpr-images/{id}/file` (default: `storage/app/anpr`) |
+| `VAPID_SUBJECT`, `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | Web Push (`config/webpush.php`) |
+| `REVERB_*` | Laravel Reverb WebSocket broadcasting |
+
+### Config files (high level)
+
+| File                     | Notes                                                       |
+| ------------------------ | ----------------------------------------------------------- |
+| `config/auth_security.php` | Login + camera auth TTL, cookies, rate limits, TOTP settings |
+| `config/profile.php`       | Profile picture, change tokens, security flags |
+| `config/blockchain.php`    | `BLOCKCHAIN_*` env mapping |
+| `config/patrol_validation.php` | M8 patrol validation thresholds |
+| `config/anpr.php`        | `image_roots` from `ANPR_IMAGE_ROOTS` |
+| `config/cors.php`        | Credentialed CORS (`supports_credentials: true`) |
+| `config/webpush.php`     | VAPID keys for Web Push |
+
+### Cache / session / queue
+
+- `.env.example` points **session**, **cache**, and **queue** at **database**-backed drivers.
+- The repository’s `database/migrations` folder **does not** include Laravel’s `jobs`, `job_batches`, `failed_jobs`, `cache`, or `sessions` table migrations. Running queue worker or database session/cache may require `**php artisan queue:table`**, `**session:table**`, `**cache:table\*\*` (or equivalent) unless another process manages schema. See [§12](#12-known-issues--technical-debt).
+
+### Storage & logging
+
+- Default disk: `local` → `storage/app/private` (see `config/filesystems.php`).
+- Logging: driven by `LOG_CHANNEL` / `LOG_STACK` (default stack → single file channel in typical Laravel setup).
+
+---
+
+## 9. External integrations
+
+Implemented **application code** integrations in this repo:
+
+| Integration                         | Status                                                                                                               |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Payment gateways                    | **None** in `app/` or project `config/` (beyond generic Laravel/AWS placeholders).                                   |
+| Third-party HTTP APIs               | **None** identified in `app/`.                                                                                       |
+| Email/SMS                           | Mail config exists; default `**log`\*\* driver in `.env.example` — no custom mailers in `app/`.                      |
+| Firebase / Stripe / OAuth providers | **Not implemented** in application code (no SDK usage under `app/`).                                                 |
+| Cloud storage                       | **Optional** S3 disk via `AWS_*` env vars in `config/filesystems.php`; no app code exclusively tied to S3 in `app/`. |
+
+**Blockchain:** `config/blockchain.php` loads `BLOCKCHAIN_*` environment variables (disabled by default). Validate with `php artisan blockchain:check-config`. `BlockchainHashService` (M4) builds deterministic SHA-256 hashes; `BlockchainRecordService` (M5) creates idempotent `blockchain_records` rows; `EthereumRpcClient` + `AnchorBlockchainRecordJob` (M6) anchor to Ganache when `BLOCKCHAIN_ENABLED=true`; Sepolia anchoring (M9) uses signed `eth_sendRawTransaction`; `BlockchainRetryService` (M7) handles exponential backoff; `BlockchainVerificationService` (M8) verifies records via `POST /api/blockchain-records/{id}/verify`. Blockchain read/verify/refresh APIs are **Admin only**; retry is Admin-only. M10 ANPR auto-anchoring, M11 blockchain monitoring frontend, M12 patrol/profile integration, and M13 final hardening are implemented. See `blockchain/docs/m13-final-hardening-testing-and-documentation.md`.
+
+**M6 database queue:** When `QUEUE_CONNECTION=database`, anchoring jobs are queued until a worker runs. After `BlockchainRecordService::createForEntity()` with blockchain enabled, the record may remain `queued` until `php artisan queue:work` is running in a **separate Laravel terminal**. On success, expect `blockchain_records.status = confirmed` with `tx_hash` / `block_number` / `confirmations` persisted and a `blockchain_jobs` row with `job_type = anchor`, `status = success`.
+
+---
+
+## 10. Dependencies
+
+### Composer (summary)
+
+| Package                          | Why it matters here                   |
+| -------------------------------- | ------------------------------------- |
+| `laravel/framework`              | HTTP, routing, Eloquent, config, etc. |
+| `php-open-source-saver/jwt-auth` | JWT guard, login token issuance       |
+| `laravel/tinker`                 | Interactive debugging                 |
+
+Dev dependencies: testing (PHPUnit), fake data (Faker), Pint, Pail/Pao, Collision.
+
+### NPM (summary)
+
+| Package                            | Why it matters here                           |
+| ---------------------------------- | --------------------------------------------- |
+| `vite`, `laravel-vite-plugin`      | Build/serve frontend assets                   |
+| `tailwindcss`, `@tailwindcss/vite` | CSS pipeline for bundled views                |
+| `concurrently`                     | Composer `dev` script runs multiple processes |
+
+---
+
+## 11. Deployment & environment setup
+
+### Installation (typical)
+
+1. **PHP 8.3+**, **Composer**, **Node.js** (for Vite if building assets).
+2. Clone repo, `cd backend`.
+3. `composer install`
+4. Copy `.env.example` → `.env`; `php artisan key:generate`
+5. `php artisan jwt:secret` (or set `JWT_SECRET` securely) — required for JWT.
+6. Configure `DB_*` (SQLite file or MySQL/Postgres).
+7. `php artisan migrate`
+8. Optional: `php artisan db:seed` (seeds roles, demo users, zones, blockchain records, patrol sessions, checkpoints, checkpoint events when prerequisites exist).
+9. `npm install` and `npm run build` if shipping compiled assets.
+
+Composer also defines `composer run setup` to chain install, env, key, migrate, npm install, and `npm run build`.
+
+### Required services
+
+- **Web server** or `php artisan serve` for HTTP.
+- **Database** per `DB_CONNECTION`.
+- If using **database** queue/session/cache: ensure **tables exist** (see [§8](#8-configuration) / [§13](#13-known-issues--technical-debt)).
+
+### Queue workers
+
+- `.env.example` uses `QUEUE_CONNECTION=database`. Composer `**dev**` script runs `php artisan queue:listen`.
+- **Production:** use a supervised `queue:work` process (see `deploy_documentation.md` systemd example).
+- **Blockchain:** when `BLOCKCHAIN_ENABLED=true`, `AnchorBlockchainRecordJob` and `RefreshSubmittedBlockchainRecordJob` require a running worker.
+
+### Cron
+
+- Standard Laravel scheduler: `**php artisan schedule:run`** each minute — **no app schedules\*\* are defined in this project’s source tree.
+
+### Build commands
+
+- `npm run dev` — Vite dev server
+- `npm run build` — production asset build
+
+### Migrations
+
+- `php artisan migrate`
+- Fresh demo: `php artisan migrate:fresh --seed` (destructive)
+- Targeted checkpoint seed: `php artisan db:seed --class=CheckpointSeeder`
+- Targeted patrol session seed: `php artisan db:seed --class=PatrolSessionSeeder`
+- Targeted checkpoint event seed: `php artisan db:seed --class=CheckpointEventSeeder`
+
+### Production notes
+
+- Set `APP_DEBUG=false`, strong `APP_KEY`, secure `JWT_SECRET`.
+- Ensure HTTPS for token-bearing clients.
+- Align session/cache/queue drivers with infrastructure (Redis vs database vs sync).
+
+---
+
+## 12. Automated test coverage
+
+The backend test suite guards patrol validation, PWA sync, summaries, metrics, routes, broadcasting, Web Push safety, and authorization. Run all tests:
+
+```bash
+php artisan test
+```
+
+**Environment (from `phpunit.xml`):** `APP_ENV=testing`, SQLite in-memory database, `BROADCAST_CONNECTION=null`, `QUEUE_CONNECTION=sync`. **No** Reverb server, queue worker, or outbound Web Push network calls are required.
+
+**External I/O:** Reverb events are asserted with `Event::fake()` where needed; `PatrolBroadcastService` is exercised with `broadcasting.default` set to `null` (disabled) or `reverb` (enabled) via `Config::set`. Web Push uses **Mockery** doubles of `WebPushNotificationService` — VAPID private keys are not used in tests.
+
+### Feature tests (`tests/Feature/`)
+
+| File | Verifies |
+| ---- | -------- |
+| `AuthRefreshTokenTest.php` | Refresh cookie, rotation, reuse revocation, logout |
+| `AuthTwoFactorTest.php` | Password setup → 2FA setup → OTP login |
+| `AuthPasswordSetupTest.php` | First-login password setup |
+| `AuthSessionMonitoringTest.php` | Session list/revoke/logout-all |
+| `AuthAuditLogTest.php` | Admin audit log API |
+| `AuthRateLimitLockoutTest.php` | Login/OTP lockout; soft-deleted user |
+| `AuthCorsTest.php` | Credentialed CORS |
+| `AuthSecuritySettingsTest.php` | Admin 2FA reset; password-change invalidation |
+| `AuthRouteGuardHardeningTest.php` | Role route protection |
+| `AuthFinalHardeningTest.php` | M10 umbrella regression |
+| `CameraAuthTest.php` | Camera login |
+| `CameraAnprWriteTest.php` | Camera ANPR write + heartbeat |
+| `CameraCrudTest.php`, `CameraCredentialHardeningTest.php`, `CameraTokenSecurityTest.php` | Camera admin CRUD + token separation |
+| `DashboardSummaryTest.php` | Role-aware dashboard summary |
+| `Profile/*` (11 files) | Profile read/update, picture, password, email, 2FA reconfigure, step-up, audit, blockchain |
+| `PatrolValidationTest.php` | Full validation algorithm (M8 thresholds) |
+| `PatrolSessionTest.php`, `PatrolSummaryTest.php`, `PatrolRouteTest.php` | Patrol session CRUD, summary, routes |
+| `PatrolBroadcastTest.php`, `PatrolTokenExpiryTest.php` | Broadcasting, token expiry + PWA sync |
+| `CheckpointEventTest.php`, `CheckpointEventMetricTest.php` | Checkpoint events |
+| `LocationLogTest.php`, `PwaSyncTest.php` | Location logs, offline sync |
+| `AnprMonitoringTest.php`, `AnprVehicleLinkingTest.php`, `AnprM14RegressionTest.php` | ANPR monitoring + linking |
+| `Blockchain/*` (12 feature files) | Anchoring, retry, refresh, verification, monitoring API, integrations |
+| `WebPushNotificationTest.php` | Push subscriptions |
+| `AuthorizationTest.php` | Role-based access |
+
+### M14 ANPR test commands
+
+```bash
+php artisan test --filter=Anpr
+php artisan test
+```
+
+### Unit tests (`tests/Unit/`)
+
+| File | Verifies |
+| ---- | -------- |
+| `PatrolSessionSummaryServiceTest.php` | Summary confidence thresholds |
+| `Auth/PasswordSetupServiceTest.php`, `Auth/RefreshTokenServiceTest.php`, `Auth/TwoFactorServiceTest.php` | Auth service units |
+| `Profile/ProfileSecurityServiceTest.php` | Profile step-up verification |
+| `Blockchain/*` (7 unit files) | Hashing, RPC client, retry, canonical JSON, transaction signer |
+
+**Focused test commands:**
+
+```bash
+php artisan test --filter=Auth
+php artisan test --filter=Profile
+php artisan test --filter=Camera
+php artisan test --filter=Anpr
+php artisan test --filter=Patrol
+php artisan test --filter=Blockchain
+php artisan test --filter=Dashboard
+php artisan test --filter=Pwa
+```
+
+### Test helpers
+
+| Path                                       | Role                                                            |
+| ------------------------------------------ | --------------------------------------------------------------- |
+| `tests/Concerns/CreatesPatrolUsers.php`    | Admin / Guard / Security Operator users after `RoleSeeder`      |
+| `tests/Concerns/CreatesPatrolFixtures.php` | Zone + checkpoint + patrol context; `seedLocationLogs()` helper |
+
+### Factories
+
+Uses `RefreshDatabase` + `RoleSeeder`. Factories: `UserFactory`, `ZoneFactory`, `CheckpointFactory`, `PatrolSessionFactory`, `CheckpointEventFactory` (explicit UUID `id`), `CheckpointEventMetricFactory`, `**PatrolRouteFactory`\*\* (added for route tests).
+
+### Validation engine regression
+
+`PatrolValidationTest` is the primary regression suite for `PatrolValidationService` (gaps, segments, checkpoint scoring, anomaly `items`, persistence). Run after any change to validation or anomaly visualization payloads.
+
+---
+
+## 13. Known issues / technical debt
+
+### Security & access control
+
+- User/role checks are middleware-based (`admin`) and not yet centralized in Laravel Policies/Gates.
+
+### Routing / controller consistency
+
+- No major route parameter mismatch found for user routes (`{user}` is used consistently for show/update/destroy/restore).
+
+### Schema vs code
+
+- `**Role**` has no inverse `users()` relationship (minor maintainability gap).
+
+### Response consistency
+
+- Mixed JSON envelopes (`JsonResource` vs `{ success, message, data }` vs plain `message` vs 204) complicate client integration.
+
+### Configuration vs migrations
+
+- `.env.example` defaults to **database** session driver and **database** queue, but **no** `jobs`, `cache`, or `sessions` migrations are committed. Fresh installs must run `php artisan session:table`, `php artisan queue:table`, and migrate before database session/queue work. **Blockchain anchoring fails silently** (records stay `queued`) if `QUEUE_CONNECTION=database` without a worker.
+
+### User disablement note
+
+- There is **no** `users.is_active` column. Disabled accounts use **soft delete** (`deleted_at`); `EnsureUserIsActive` and refresh endpoints reject soft-deleted users.
+
+### Validation / error handling
+
+- `**StoreUserRequest` / `UpdateUserRequest`\*\*: `authorize()` always returns `true` — no role-based authorization in Form Requests.
+- `**BlockchainRecordController@index**`: uses `request()->validate(...)`; failed validation follows global handler (422 JSON).
+
+### Duplicated logic
+
+- `**ZoneController**` duplicates `auth:api` (route group + constructor middleware).
+- Login validation is inline in `**AuthController**` while other areas use Form Requests.
+
+### Performance
+
+- No explicit N+1 protection on `BlockchainRecordController@index` (simple query); `UserController@index` uses `with('role')`. Zone listing uses `with('creator')->withCount('checkpoints')`. **Unable to determine** production load characteristics from code alone.
+
+---
+
+_Generated from repository analysis. Recent additions: **automated test suite expansion** ([§12](#12-automated-test-coverage)), **Laravel Reverb realtime** (`App\Events\Patrol\*`, `PatrolBroadcastService`), `**patrol_routes`** + `**PatrolRouteFactory**`, `**POST /api/pwa/sync**`, validation `**anomalies.items**`(map visualization),`**GET /api/patrol-sessions/{id}/summary\*\*`. Update this file when routes, schema, auth, or tests change._

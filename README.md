@@ -1,18 +1,16 @@
-[2608-CSP600] 2024692584 (06) MUHAMMAD IKHWAN ARIFI BIN ISMAIL
-BLOCKCHAIN-BASED AI SURVEILLANCE WITH GEOLOCATION AND PWA INTEGRATION
+# VeriPatrol
 
-================================================================================
-HOW TO USE / SETUP / LINK THE SYSTEM / PROTOTYPE / DATABASE / RAW DATA
-Product name: VeriPatrol
-================================================================================
+**Project:** Blockchain-Based AI Surveillance with Geolocation and PWA Integration  
+**Course:** 2608-CSP600  
+**Student:** 2024692584 (06) Muhammad Ikhwan Arifi Bin Ismail
+
+Setup, integration, prototype, database, and raw-data guide.
 
 This repository contains the Final Year Project prototype for a high-security
 surveillance platform with AI ANPR, patrol geolocation (PWA), and blockchain
 tamper-evident proof.
 
---------------------------------------------------------------------------------
-1. REPOSITORY STRUCTURE
---------------------------------------------------------------------------------
+## 1. Repository Structure
 
   frontend/                   React 19 + Vite 7 dashboard / PWA (VeriPatrol UI)
   backend/                    Laravel 13 API, MySQL, JWT auth, queues, Reverb
@@ -21,9 +19,7 @@ tamper-evident proof.
   docs/                       Deployment and module documentation
   .gitignore                  Shared ignore rules for the monorepo
 
---------------------------------------------------------------------------------
-2. PREREQUISITES
---------------------------------------------------------------------------------
+## 2. Prerequisites
 
   - PHP 8.3+, Composer
   - MySQL 8.0+
@@ -34,9 +30,7 @@ tamper-evident proof.
   - Optional: PHP ext-gmp for Sepolia signed transactions
   - Optional: CUDA GPU for faster ANPR inference
 
---------------------------------------------------------------------------------
-3. DATABASE SETUP (Laravel / MySQL)
---------------------------------------------------------------------------------
+## 3. Database Setup (Laravel / MySQL)
 
   1) Create a MySQL database, for example:
 
@@ -76,9 +70,7 @@ tamper-evident proof.
   Optional demo seeders (zones, cameras, patrol, ANPR, blockchain) are listed
   in database/seeders/DatabaseSeeder.php and can be enabled if needed.
 
---------------------------------------------------------------------------------
-4. BACKEND SETUP (API PROTOTYPE)
---------------------------------------------------------------------------------
+## 4. Backend Setup (API Prototype)
 
   From the repository root:
 
@@ -110,9 +102,7 @@ tamper-evident proof.
 
   Full deployment notes: docs/deploy-documentation.md
 
---------------------------------------------------------------------------------
-5. FRONTEND SETUP (DASHBOARD / PWA)
---------------------------------------------------------------------------------
+## 5. Frontend Setup (Dashboard / PWA)
 
   From the repository root, in a separate terminal:
 
@@ -143,9 +133,7 @@ tamper-evident proof.
   mobile/PWA patrol workflow. Admin and Security Operator can access patrol and
   ANPR monitoring; blockchain monitoring is Admin-only.
 
---------------------------------------------------------------------------------
-6. AI ANPR SETUP AND LINKING TO BACKEND
---------------------------------------------------------------------------------
+## 6. AI ANPR Setup and Backend Integration
 
   From the repository root, in a separate terminal:
 
@@ -188,9 +176,7 @@ tamper-evident proof.
   For local metadata mode only, set ANPR_EVIDENCE_MODE=metadata and configure
   Laravel ANPR_IMAGE_ROOTS to the AI runs directory on this machine.
 
---------------------------------------------------------------------------------
-7. BLOCKCHAIN SETUP AND LINKING
---------------------------------------------------------------------------------
+## 7. Blockchain Setup and Integration
 
   The chain stores HASHES ONLY (no images, plates, GPS, or personal data).
   Laravel owns anchoring; React and AI never call Ethereum directly.
@@ -217,9 +203,7 @@ tamper-evident proof.
 
   Admin UI: /admin/blockchain-monitoring (Admin role only)
 
---------------------------------------------------------------------------------
-8. HOW THE PROTOTYPE MODULES LINK TOGETHER
---------------------------------------------------------------------------------
+## 8. How the Prototype Modules Link Together
 
   React (frontend)
       |  HTTPS/JSON + JWT (+ optional Reverb WebSocket, Web Push)
@@ -241,9 +225,7 @@ tamper-evident proof.
     7. (Optional) Guard logs in on mobile PWA, runs patrol with geolocation,
        Admin views Patrol Monitoring
 
---------------------------------------------------------------------------------
-9. RAW DATA / SAMPLE DATA
---------------------------------------------------------------------------------
+## 9. Raw Data / Sample Data
 
   AI ANPR samples currently included in the repository:
        anpr/samples/images/photo_6177158287829176211_w.jpg
@@ -272,9 +254,7 @@ tamper-evident proof.
 
   Do not commit secrets (.env, private keys, camera passwords, JWT secrets).
 
---------------------------------------------------------------------------------
-10. QUICK LOCAL START CHECKLIST
---------------------------------------------------------------------------------
+## 10. Quick Local Start Checklist
 
   [ ] MySQL running; database created
   [ ] backend: .env, composer install, migrate, seed, storage:link
